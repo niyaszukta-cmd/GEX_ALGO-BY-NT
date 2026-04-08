@@ -1,17 +1,13 @@
 # ============================================================================
-# HedGEX — Cascade Backtest Engine  v2
+# HedGEX — Cascade Backtest Engine  v3
 # Powered by NYZTrade Analytics Pvt. Ltd.
 #
-# Strategy: Strike-Level Custom Entry/Exit
-#   CALL : IV Expanding + ATM+1 cascade pts > threshold → BUY ATM+1 Call
-#          Target = min(cumulative cascade ATM+1→ATM+3, max_target) from spot
-#          Stop   = fixed pts below spot
-#   PUT  : IV Expanding + ATM-1 cascade pts > threshold → BUY ATM-1 Put
-#          Target = min(cumulative cascade ATM-1→ATM-3, max_target) from spot
-#          Stop   = fixed pts above spot
-#
-# Data : Dhan Rolling Option API v2
-# Engine: GEX Cascade Mathematics
+# v3 changes vs v2:
+#   • Results tab: full tabulation with Buy Price, Sell Price, P&L per lot,
+#     sub-tabs for Summary / CALL trades / PUT trades / Monthly / Winners-Losers
+#   • Intraday vs CNC backtesting modes (separate runs, separate DB tables)
+#   • Data Management tab: granular reset — trades only, signals only,
+#     raw chain only, or full wipe per symbol or all symbols
 # ============================================================================
 
 import streamlit as st
@@ -60,6 +56,9 @@ INSTRUMENT_PARAMS = {
     "SENSEX":     {"pts_per_unit": 0.025, "strike_cap": 500},
 }
 
+# CNC holding days (simulated multi-day hold)
+CNC_HOLD_DAYS = 5
+
 # ── Styling ───────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
@@ -80,6 +79,14 @@ html,body,[class*="css"]{font-family:'Space Grotesk',sans-serif;}
   border-radius:6px;padding:10px 14px;font-family:"JetBrains Mono",monospace;font-size:0.80rem;line-height:1.8;}
 .warn-box{background:rgba(245,158,11,0.08);border-left:3px solid #f59e0b;
   border-radius:6px;padding:10px 14px;font-family:"JetBrains Mono",monospace;font-size:0.80rem;line-height:1.8;}
+.danger-box{background:rgba(239,68,68,0.08);border-left:3px solid #ef4444;
+  border-radius:6px;padding:10px 14px;font-family:"JetBrains Mono",monospace;font-size:0.80rem;line-height:1.8;}
+.mode-intraday{background:linear-gradient(135deg,rgba(0,212,255,0.15),rgba(0,212,255,0.05));
+  border:1px solid rgba(0,212,255,0.4);border-radius:10px;padding:10px 16px;margin-bottom:8px;
+  font-family:"JetBrains Mono",monospace;font-size:0.78rem;}
+.mode-cnc{background:linear-gradient(135deg,rgba(167,139,250,0.15),rgba(167,139,250,0.05));
+  border:1px solid rgba(167,139,250,0.4);border-radius:10px;padding:10px 16px;margin-bottom:8px;
+  font-family:"JetBrains Mono",monospace;font-size:0.78rem;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -114,6 +121,7 @@ def get_headers() -> Dict:
 # ── Database ──────────────────────────────────────────────────────────────────
 def init_db():
     con = sqlite3.connect(DB_PATH); cur = con.cursor()
+
     cur.execute("""CREATE TABLE IF NOT EXISTS raw_chain(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         symbol TEXT, trade_date TEXT, timestamp TEXT,
@@ -125,6 +133,7 @@ def init_db():
         call_oi_chg REAL, put_oi_chg REAL,
         interval TEXT, expiry_code INTEGER, expiry_flag TEXT,
         UNIQUE(symbol,trade_date,timestamp,strike_type,expiry_code,expiry_flag))""")
+
     cur.execute("""CREATE TABLE IF NOT EXISTS cascade_signals(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         symbol TEXT, trade_date TEXT, timestamp TEXT, spot_price REAL,
@@ -135,18 +144,30 @@ def init_db():
         net_gex_total REAL, signal TEXT, signal_strength REAL,
         cascade_target REAL, cascade_stop REAL,
         UNIQUE(symbol,trade_date,timestamp))""")
+
+    # bt_trades now has bt_mode column (INTRADAY / CNC)
     cur.execute("""CREATE TABLE IF NOT EXISTS bt_trades(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         symbol TEXT, trade_date TEXT, entry_time TEXT, exit_time TEXT,
         direction TEXT, entry_price REAL, exit_price REAL,
-        pts_captured REAL, cascade_target REAL, cascade_stop REAL,
+        pts_captured REAL, pnl_per_lot REAL,
+        cascade_target REAL, cascade_stop REAL,
         exit_reason TEXT, bear_quality REAL, bull_quality REAL,
         iv_regime TEXT, signal_strength REAL,
-        is_expiry_day INTEGER, expiry_flag TEXT)""")
+        is_expiry_day INTEGER, expiry_flag TEXT,
+        bt_mode TEXT DEFAULT 'INTRADAY')""")
+
+    # Migration: add bt_mode and pnl_per_lot if DB was created by v2
+    for col, defval in [("bt_mode","'INTRADAY'"), ("pnl_per_lot","0.0")]:
+        try:
+            cur.execute(f"ALTER TABLE bt_trades ADD COLUMN {col} TEXT DEFAULT {defval}")
+        except: pass
+
     cur.execute("""CREATE TABLE IF NOT EXISTS fetch_log(
         symbol TEXT, trade_date TEXT, expiry_code INTEGER, expiry_flag TEXT,
         status TEXT, rows_fetched INTEGER, fetched_at TEXT,
         PRIMARY KEY(symbol,trade_date,expiry_code,expiry_flag))""")
+
     con.commit(); con.close()
 
 def get_fetch_log(symbol, expiry_code, expiry_flag):
@@ -211,35 +232,67 @@ def save_trades(rows):
     con = sqlite3.connect(DB_PATH)
     con.executemany("""INSERT INTO bt_trades
         (symbol,trade_date,entry_time,exit_time,direction,entry_price,exit_price,
-         pts_captured,cascade_target,cascade_stop,exit_reason,
-         bear_quality,bull_quality,iv_regime,signal_strength,is_expiry_day,expiry_flag)
+         pts_captured,pnl_per_lot,cascade_target,cascade_stop,exit_reason,
+         bear_quality,bull_quality,iv_regime,signal_strength,is_expiry_day,expiry_flag,bt_mode)
         VALUES(:symbol,:trade_date,:entry_time,:exit_time,:direction,:entry_price,:exit_price,
-         :pts_captured,:cascade_target,:cascade_stop,:exit_reason,
-         :bear_quality,:bull_quality,:iv_regime,:signal_strength,:is_expiry_day,:expiry_flag)""", rows)
+         :pts_captured,:pnl_per_lot,:cascade_target,:cascade_stop,:exit_reason,
+         :bear_quality,:bull_quality,:iv_regime,:signal_strength,:is_expiry_day,:expiry_flag,:bt_mode)""", rows)
     con.commit(); con.close()
 
-def load_trades(symbol=None):
+def load_trades(symbol=None, bt_mode=None):
     con = sqlite3.connect(DB_PATH)
-    q = "SELECT * FROM bt_trades WHERE symbol=? ORDER BY trade_date,entry_time" if symbol \
-        else "SELECT * FROM bt_trades ORDER BY trade_date,entry_time"
-    df = pd.read_sql_query(q, con, params=(symbol,) if symbol else ()); con.close()
+    conditions = []
+    params = []
+    if symbol:
+        conditions.append("symbol=?"); params.append(symbol)
+    if bt_mode:
+        conditions.append("bt_mode=?"); params.append(bt_mode)
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    q = f"SELECT * FROM bt_trades {where} ORDER BY trade_date,entry_time"
+    df = pd.read_sql_query(q, con, params=params); con.close()
     return df
 
-def clear_trades(symbol=None):
+def clear_trades(symbol=None, bt_mode=None):
     con = sqlite3.connect(DB_PATH)
-    con.execute("DELETE FROM bt_trades WHERE symbol=?" if symbol else "DELETE FROM bt_trades",
-                (symbol,) if symbol else ())
+    conditions = []
+    params = []
+    if symbol:
+        conditions.append("symbol=?"); params.append(symbol)
+    if bt_mode:
+        conditions.append("bt_mode=?"); params.append(bt_mode)
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    con.execute(f"DELETE FROM bt_trades {where}", params)
+    con.commit(); con.close()
+
+def clear_signals(symbol=None):
+    con = sqlite3.connect(DB_PATH)
+    if symbol:
+        con.execute("DELETE FROM cascade_signals WHERE symbol=?", (symbol,))
+    else:
+        con.execute("DELETE FROM cascade_signals")
+    con.commit(); con.close()
+
+def clear_raw_chain(symbol=None):
+    con = sqlite3.connect(DB_PATH)
+    if symbol:
+        con.execute("DELETE FROM raw_chain WHERE symbol=?", (symbol,))
+        con.execute("DELETE FROM fetch_log WHERE symbol=?", (symbol,))
+    else:
+        con.execute("DELETE FROM raw_chain")
+        con.execute("DELETE FROM fetch_log")
     con.commit(); con.close()
 
 def db_stats():
     con = sqlite3.connect(DB_PATH); cur = con.cursor()
     cur.execute("SELECT COUNT(*) FROM raw_chain");         rr = cur.fetchone()[0]
     cur.execute("SELECT COUNT(DISTINCT trade_date),COUNT(DISTINCT symbol) FROM raw_chain")
-    days,syms = cur.fetchone()
-    cur.execute("SELECT COUNT(*) FROM bt_trades");         tr = cur.fetchone()[0]
+    days, syms = cur.fetchone()
+    cur.execute("SELECT COUNT(*) FROM bt_trades WHERE bt_mode='INTRADAY'"); ti = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM bt_trades WHERE bt_mode='CNC'");      tc = cur.fetchone()[0]
     cur.execute("SELECT COUNT(*) FROM cascade_signals");   sg = cur.fetchone()[0]
     con.close()
-    return {"raw_rows":rr,"days":days,"symbols":syms,"trades":tr,"signals":sg}
+    return {"raw_rows":rr,"days":days,"symbols":syms,
+            "trades_intraday":ti,"trades_cnc":tc,"signals":sg}
 
 # ── Checkpoint ────────────────────────────────────────────────────────────────
 def save_checkpoint(symbol, trade_date, expiry_code, expiry_flag, completed, rows):
@@ -417,7 +470,7 @@ def get_trading_dates(start, end):
 def compute_iv_regime_series(df):
     rows = []
     for ts, grp in df.groupby("timestamp", sort=True):
-        avg_iv = (grp["call_iv"].mean() + grp["put_iv"].mean()) / 2
+        avg_iv  = (grp["call_iv"].mean() + grp["put_iv"].mean()) / 2
         iv_skew = grp["put_iv"].mean() - grp["call_iv"].mean()
         rows.append({"timestamp": ts, "avg_iv": avg_iv, "iv_skew": iv_skew})
     iv_df = pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
@@ -429,7 +482,7 @@ def compute_iv_regime_series(df):
         lambda x: "EXPANDING" if x>thr else ("COMPRESSING" if x<-thr else "FLAT"))
     return iv_df
 
-# ── Cascade engine (kept intact for Tab 2 signals) ────────────────────────────
+# ── Cascade engine (Tab 2 signals — kept intact) ──────────────────────────────
 VANNA_ADJ = {
     "SUPPORT_FLOOR":      {"COMPRESSING":0.60,"FLAT":0.35,"EXPANDING":-0.20},
     "TRAP_DOOR":          {"EXPANDING":-0.30,"FLAT":0.10,"COMPRESSING":0.15},
@@ -438,9 +491,9 @@ VANNA_ADJ = {
 }
 
 def compute_cascade_for_snapshot(df_ts, spot, symbol, iv_regime):
-    params       = INSTRUMENT_PARAMS.get(symbol, INSTRUMENT_PARAMS["NIFTY"])
-    ppu          = params["pts_per_unit"]
-    cap          = params["strike_cap"]
+    params = INSTRUMENT_PARAMS.get(symbol, INSTRUMENT_PARAMS["NIFTY"])
+    ppu    = params["pts_per_unit"]
+    cap    = params["strike_cap"]
     vz_map = {}
     strikes_s = sorted(df_ts["strike"].unique())
     vs = [(s, df_ts[df_ts["strike"]==s]["net_vanna"].iloc[0])
@@ -487,8 +540,8 @@ def compute_signals_for_day(df_day, symbol, trade_date):
     iv_df = compute_iv_regime_series(df_day)
     rows  = []
     for ts in sorted(df_day["timestamp"].unique()):
-        df_ts = df_day[df_day["timestamp"]==ts].copy()
-        spot  = df_ts["spot_price"].mean()
+        df_ts  = df_day[df_day["timestamp"]==ts].copy()
+        spot   = df_ts["spot_price"].mean()
         iv_row = iv_df[iv_df["timestamp"]==ts]
         if iv_row.empty: iv_regime,avg_iv,iv_skew = "FLAT",15.0,0.0
         else:
@@ -503,67 +556,34 @@ def compute_signals_for_day(df_day, symbol, trade_date):
     return rows
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# CUSTOM STRATEGY — Strike-level cascade energy helper
+# CUSTOM STRATEGY — helpers
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def get_strike_cascade_pts(df_ts, strike_types, symbol):
-    """
-    Returns { strike_type: cascade_pts } for a single-bar snapshot.
-    cascade_pts = abs(net_gex) * pts_per_unit
-    """
     ppu    = INSTRUMENT_PARAMS.get(symbol, INSTRUMENT_PARAMS["NIFTY"])["pts_per_unit"]
     result = {}
     for st in strike_types:
         rows = df_ts[df_ts["strike_type"] == st]
-        if rows.empty:
-            result[st] = 0.0
-        else:
-            net_gex = rows["net_gex"].iloc[0]
-            result[st] = abs(net_gex) * ppu
+        result[st] = 0.0 if rows.empty else abs(rows["net_gex"].iloc[0]) * ppu
     return result
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# CUSTOM STRATEGY — Per-bar signal builder (reads raw_chain directly)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def compute_strike_signals_for_day(df_day, symbol, trade_date, iv_df,
                                    cascade_entry_threshold, max_target_pts):
-    """
-    Walks every bar in df_day and returns a list of bar-dicts with:
-        timestamp, spot, iv_regime,
-        call_signal, call_target, call_stop,
-        put_signal,  put_target,  put_stop,
-        atm1_pts, atm_neg1_pts, call_cum_pts, put_cum_pts
-
-    CALL entry condition:
-        iv_regime == EXPANDING  AND  ATM+1 cascade pts > cascade_entry_threshold
-        target = spot + min(ATM+1 + ATM+2 + ATM+3 cascade pts, max_target_pts)
-
-    PUT entry condition:
-        iv_regime == EXPANDING  AND  ATM-1 cascade pts > cascade_entry_threshold
-        target = spot - min(ATM-1 + ATM-2 + ATM-3 cascade pts, max_target_pts)
-    """
     bars = []
     for ts in sorted(df_day["timestamp"].unique()):
         df_ts = df_day[df_day["timestamp"] == ts]
         spot  = df_ts["spot_price"].mean()
 
-        # IV regime for this bar
         iv_row    = iv_df[iv_df["timestamp"] == ts]
         iv_regime = str(iv_row.iloc[0]["iv_regime"]) if not iv_row.empty else "FLAT"
 
-        # ── CALL side: ATM+1, ATM+2, ATM+3 ──────────────────────────────
-        call_strikes = ["ATM+1", "ATM+2", "ATM+3"]
-        c_pts        = get_strike_cascade_pts(df_ts, call_strikes, symbol)
+        c_pts        = get_strike_cascade_pts(df_ts, ["ATM+1","ATM+2","ATM+3"], symbol)
         atm1_pts     = c_pts.get("ATM+1", 0.0)
         call_cum     = sum(c_pts.values())
         call_tgt_pts = min(call_cum, max_target_pts)
         call_signal  = (iv_regime == "EXPANDING") and (atm1_pts > cascade_entry_threshold)
 
-        # ── PUT side: ATM-1, ATM-2, ATM-3 ───────────────────────────────
-        put_strikes  = ["ATM-1", "ATM-2", "ATM-3"]
-        p_pts        = get_strike_cascade_pts(df_ts, put_strikes, symbol)
+        p_pts        = get_strike_cascade_pts(df_ts, ["ATM-1","ATM-2","ATM-3"], symbol)
         atm_neg1_pts = p_pts.get("ATM-1", 0.0)
         put_cum      = sum(p_pts.values())
         put_tgt_pts  = min(put_cum, max_target_pts)
@@ -573,13 +593,10 @@ def compute_strike_signals_for_day(df_day, symbol, trade_date, iv_df,
             "timestamp":    ts,
             "spot":         round(spot, 2),
             "iv_regime":    iv_regime,
-            # CALL
             "call_signal":  call_signal,
             "call_target":  round(spot + call_tgt_pts, 2),
-            # PUT
             "put_signal":   put_signal,
             "put_target":   round(spot - put_tgt_pts, 2),
-            # diagnostics
             "atm1_pts":     round(atm1_pts, 2),
             "atm_neg1_pts": round(atm_neg1_pts, 2),
             "call_cum_pts": round(call_cum, 2),
@@ -587,53 +604,20 @@ def compute_strike_signals_for_day(df_day, symbol, trade_date, iv_df,
         })
     return bars
 
-
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# CUSTOM STRATEGY — Backtest engine
+# BACKTEST ENGINE — INTRADAY
+# Trades open and close within the same day (EOD forced exit)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def run_backtest_for_day(signals,           # kept for Tab 3 signature compat (not used)
-                         symbol,
-                         trade_date,
-                         expiry_flag,
-                         min_quality,       # legacy param (not used in strike strategy)
-                         require_iv,        # legacy param (not used in strike strategy)
-                         # ── custom strategy params ──────────────────────
-                         cascade_entry_threshold=50.0,
-                         max_target_pts=200.0,
-                         fixed_sl_pts=50.0,
-                         direction_filter="BOTH",
-                         max_trades_per_day=2,
-                         df_day=None,
-                         iv_df=None):
-    """
-    Strike-Level Cascade Entry/Exit Backtest
-
-    CALL trade  (BUY ATM+1 Call):
-        Entry  : iv_regime==EXPANDING  AND  ATM+1 cascade pts > cascade_entry_threshold
-        Target : spot + min(ATM+1+ATM+2+ATM+3 cascade pts,  max_target_pts)
-        Stop   : spot - fixed_sl_pts
-
-    PUT trade  (BUY ATM-1 Put):
-        Entry  : iv_regime==EXPANDING  AND  ATM-1 cascade pts > cascade_entry_threshold
-        Target : spot - min(ATM-1+ATM-2+ATM-3 cascade pts, max_target_pts)
-        Stop   : spot + fixed_sl_pts
-
-    CALL and PUT trades are tracked independently — both can be open simultaneously.
-    max_trades_per_day counts CALL + PUT combined.
-    """
-    if df_day is None or df_day.empty:
-        return []
-
-    if iv_df is None:
-        iv_df = compute_iv_regime_series(df_day)
+def run_intraday_day(df_day, symbol, trade_date, expiry_flag,
+                     cascade_entry_threshold, max_target_pts, fixed_sl_pts,
+                     direction_filter, max_trades_per_day, lots, iv_df):
+    if df_day is None or df_day.empty: return []
+    contract_size = INDEX_CONFIG.get(symbol,{}).get("contract_size", 25)
 
     bar_signals = compute_strike_signals_for_day(
-        df_day, symbol, trade_date, iv_df,
-        cascade_entry_threshold, max_target_pts)
-
-    if not bar_signals:
-        return []
+        df_day, symbol, trade_date, iv_df, cascade_entry_threshold, max_target_pts)
+    if not bar_signals: return []
 
     try:
         dt        = datetime.strptime(trade_date, "%Y-%m-%d")
@@ -642,213 +626,296 @@ def run_backtest_for_day(signals,           # kept for Tab 3 signature compat (n
         is_expiry = False
 
     trades      = []
-    trade_count = 0   # combined CALL + PUT count for the day
-
-    # ── Per-direction state ───────────────────────────────────────────────
-    call_open     = False
+    trade_count = 0
+    call_open   = put_open = False
     call_entry_ts = call_entry_px = call_tgt = call_stp = call_cum = None
-
-    put_open      = False
-    put_entry_ts  = put_entry_px = put_tgt = put_stp = put_cum = None
+    put_entry_ts  = put_entry_px  = put_tgt  = put_stp  = put_cum  = None
 
     for bar in bar_signals:
-        ts    = bar["timestamp"]
-        spot  = bar["spot"]
+        ts     = bar["timestamp"]
+        spot   = bar["spot"]
         iv_reg = bar["iv_regime"]
 
-        # ── Exit: open CALL trade ─────────────────────────────────────────
         if call_open:
             pts = spot - call_entry_px
-
             if spot >= call_tgt:
-                trades.append(_mk_strike(
-                    symbol, trade_date, call_entry_ts, ts, "CALL",
-                    call_entry_px, spot, pts, call_tgt, call_stp,
-                    "TARGET_HIT", iv_reg, call_cum, is_expiry, expiry_flag))
-                call_open = False
-                trade_count += 1
-
+                trades.append(_mk_v3(symbol,trade_date,call_entry_ts,ts,"CALL",
+                    call_entry_px,spot,pts,call_tgt,call_stp,"TARGET_HIT",
+                    iv_reg,call_cum,is_expiry,expiry_flag,lots,contract_size,"INTRADAY"))
+                call_open=False; trade_count+=1
             elif spot <= call_stp:
-                trades.append(_mk_strike(
-                    symbol, trade_date, call_entry_ts, ts, "CALL",
-                    call_entry_px, spot, pts, call_tgt, call_stp,
-                    "STOP_HIT", iv_reg, call_cum, is_expiry, expiry_flag))
-                call_open = False
-                trade_count += 1
+                trades.append(_mk_v3(symbol,trade_date,call_entry_ts,ts,"CALL",
+                    call_entry_px,spot,pts,call_tgt,call_stp,"STOP_HIT",
+                    iv_reg,call_cum,is_expiry,expiry_flag,lots,contract_size,"INTRADAY"))
+                call_open=False; trade_count+=1
 
-        # ── Exit: open PUT trade ──────────────────────────────────────────
         if put_open:
             pts = put_entry_px - spot
-
             if spot <= put_tgt:
-                trades.append(_mk_strike(
-                    symbol, trade_date, put_entry_ts, ts, "PUT",
-                    put_entry_px, spot, pts, put_tgt, put_stp,
-                    "TARGET_HIT", iv_reg, put_cum, is_expiry, expiry_flag))
-                put_open = False
-                trade_count += 1
-
+                trades.append(_mk_v3(symbol,trade_date,put_entry_ts,ts,"PUT",
+                    put_entry_px,spot,pts,put_tgt,put_stp,"TARGET_HIT",
+                    iv_reg,put_cum,is_expiry,expiry_flag,lots,contract_size,"INTRADAY"))
+                put_open=False; trade_count+=1
             elif spot >= put_stp:
-                trades.append(_mk_strike(
-                    symbol, trade_date, put_entry_ts, ts, "PUT",
-                    put_entry_px, spot, pts, put_tgt, put_stp,
-                    "STOP_HIT", iv_reg, put_cum, is_expiry, expiry_flag))
-                put_open = False
-                trade_count += 1
+                trades.append(_mk_v3(symbol,trade_date,put_entry_ts,ts,"PUT",
+                    put_entry_px,spot,pts,put_tgt,put_stp,"STOP_HIT",
+                    iv_reg,put_cum,is_expiry,expiry_flag,lots,contract_size,"INTRADAY"))
+                put_open=False; trade_count+=1
 
-        # Gate: max trades per day reached
-        if trade_count >= max_trades_per_day:
-            continue
+        if trade_count >= max_trades_per_day: continue
 
-        # ── Entry: CALL ───────────────────────────────────────────────────
-        if (not call_open
-                and direction_filter in ("BOTH", "CALL only")
-                and bar["call_signal"]
-                and bar["atm1_pts"] > cascade_entry_threshold):
+        if (not call_open and direction_filter in ("BOTH","CALL only")
+                and bar["call_signal"] and bar["atm1_pts"] > cascade_entry_threshold):
+            call_open=True; call_entry_ts=ts; call_entry_px=spot
+            call_tgt=bar["call_target"]; call_stp=round(spot-fixed_sl_pts,2)
+            call_cum=bar["call_cum_pts"]
 
-            call_open     = True
-            call_entry_ts = ts
-            call_entry_px = spot
-            call_tgt      = bar["call_target"]   # already capped at max_target_pts
-            call_stp      = round(spot - fixed_sl_pts, 2)
-            call_cum      = bar["call_cum_pts"]
+        if (not put_open and direction_filter in ("BOTH","PUT only")
+                and bar["put_signal"] and bar["atm_neg1_pts"] > cascade_entry_threshold):
+            put_open=True; put_entry_ts=ts; put_entry_px=spot
+            put_tgt=bar["put_target"]; put_stp=round(spot+fixed_sl_pts,2)
+            put_cum=bar["put_cum_pts"]
 
-        # ── Entry: PUT ────────────────────────────────────────────────────
-        if (not put_open
-                and direction_filter in ("BOTH", "PUT only")
-                and bar["put_signal"]
-                and bar["atm_neg1_pts"] > cascade_entry_threshold):
-
-            put_open     = True
-            put_entry_ts = ts
-            put_entry_px = spot
-            put_tgt      = bar["put_target"]     # already capped at max_target_pts
-            put_stp      = round(spot + fixed_sl_pts, 2)
-            put_cum      = bar["put_cum_pts"]
-
-    # ── EOD exit ──────────────────────────────────────────────────────────
     if bar_signals:
-        last   = bar_signals[-1]
-        lts    = last["timestamp"]
-        lspot  = last["spot"]
-        iv_reg = last["iv_regime"]
-
+        last=bar_signals[-1]; lts=last["timestamp"]; lspot=last["spot"]; iv_reg=last["iv_regime"]
         if call_open:
-            pts = lspot - call_entry_px
-            trades.append(_mk_strike(
-                symbol, trade_date, call_entry_ts, lts, "CALL",
-                call_entry_px, lspot, pts, call_tgt, call_stp,
-                "EOD_EXIT", iv_reg, call_cum, is_expiry, expiry_flag))
-
+            pts=lspot-call_entry_px
+            trades.append(_mk_v3(symbol,trade_date,call_entry_ts,lts,"CALL",
+                call_entry_px,lspot,pts,call_tgt,call_stp,"EOD_EXIT",
+                iv_reg,call_cum,is_expiry,expiry_flag,lots,contract_size,"INTRADAY"))
         if put_open:
-            pts = put_entry_px - lspot
-            trades.append(_mk_strike(
-                symbol, trade_date, put_entry_ts, lts, "PUT",
-                put_entry_px, lspot, pts, put_tgt, put_stp,
-                "EOD_EXIT", iv_reg, put_cum, is_expiry, expiry_flag))
+            pts=put_entry_px-lspot
+            trades.append(_mk_v3(symbol,trade_date,put_entry_ts,lts,"PUT",
+                put_entry_px,lspot,pts,put_tgt,put_stp,"EOD_EXIT",
+                iv_reg,put_cum,is_expiry,expiry_flag,lots,contract_size,"INTRADAY"))
+    return trades
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# BACKTEST ENGINE — CNC (positional / multi-day hold)
+# Entry on signal bar; exit on first of:
+#   1. Target hit on any subsequent day's EOD price
+#   2. Stop hit on any subsequent day's EOD price
+#   3. Max hold days reached (forced exit at EOD)
+# All_dates list is needed to simulate multi-day progression.
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def run_cnc_backtest(all_dates, symbol, expiry_flag, expiry_code,
+                     cascade_entry_threshold, max_target_pts, fixed_sl_pts,
+                     direction_filter, max_hold_days, lots,
+                     status_placeholder=None):
+    """
+    CNC positional backtest — entry intrabar, exit on subsequent EOD prices.
+    Uses the last bar of each day as the EOD/settlement price.
+    """
+    contract_size = INDEX_CONFIG.get(symbol,{}).get("contract_size", 25)
+    trades        = []
+    open_positions= []   # list of dicts: {direction, entry_date, entry_price, tgt, stp, cum, iv_reg, is_expiry}
+
+    for date_idx, trade_date in enumerate(all_dates):
+        if status_placeholder:
+            status_placeholder.text(f"CNC: {trade_date} ({date_idx+1}/{len(all_dates)})")
+
+        df_day = load_raw_chain(symbol, trade_date, expiry_code, expiry_flag)
+        if df_day.empty: continue
+        iv_df  = compute_iv_regime_series(df_day)
+
+        # EOD price = last bar's spot
+        bars     = compute_strike_signals_for_day(
+            df_day, symbol, trade_date, iv_df, cascade_entry_threshold, max_target_pts)
+        if not bars: continue
+        eod_spot = bars[-1]["spot"]
+        eod_iv   = bars[-1]["iv_regime"]
+
+        try:
+            dt        = datetime.strptime(trade_date, "%Y-%m-%d")
+            is_expiry = (dt.weekday() == 3 if expiry_flag == "WEEK" else False)
+        except:
+            is_expiry = False
+
+        # ── Step 1: manage existing open positions against today's EOD price ──
+        still_open = []
+        for pos in open_positions:
+            held_days = date_idx - pos["entry_day_idx"]
+            pts_call  = eod_spot - pos["entry_price"] if pos["direction"]=="CALL" else pos["entry_price"] - eod_spot
+
+            exit_reason = None
+            if pos["direction"] == "CALL":
+                pts = eod_spot - pos["entry_price"]
+                if eod_spot >= pos["tgt"]:      exit_reason = "TARGET_HIT"
+                elif eod_spot <= pos["stp"]:     exit_reason = "STOP_HIT"
+                elif held_days >= max_hold_days: exit_reason = "MAX_HOLD_EXIT"
+            else:
+                pts = pos["entry_price"] - eod_spot
+                if eod_spot <= pos["tgt"]:      exit_reason = "TARGET_HIT"
+                elif eod_spot >= pos["stp"]:     exit_reason = "STOP_HIT"
+                elif held_days >= max_hold_days: exit_reason = "MAX_HOLD_EXIT"
+
+            if exit_reason:
+                if pos["direction"] == "CALL": pts = eod_spot - pos["entry_price"]
+                else:                          pts = pos["entry_price"] - eod_spot
+                trades.append(_mk_v3(
+                    symbol, pos["entry_date"], pos["entry_ts"], trade_date + " EOD",
+                    pos["direction"], pos["entry_price"], eod_spot, pts,
+                    pos["tgt"], pos["stp"], exit_reason,
+                    eod_iv, pos["cum"], pos["is_expiry"], expiry_flag,
+                    lots, contract_size, "CNC"))
+            else:
+                still_open.append(pos)
+        open_positions = still_open
+
+        # ── Step 2: look for new entries on today's intraday bars ─────────────
+        for bar in bars:
+            if len(open_positions) >= 2: break   # max 2 concurrent CNC positions
+
+            ts     = bar["timestamp"]
+            spot   = bar["spot"]
+            iv_reg = bar["iv_regime"]
+
+            if (direction_filter in ("BOTH","CALL only") and bar["call_signal"]
+                    and bar["atm1_pts"] > cascade_entry_threshold
+                    and not any(p["direction"]=="CALL" for p in open_positions)):
+                open_positions.append({
+                    "direction": "CALL", "entry_date": trade_date,
+                    "entry_ts": ts, "entry_price": spot,
+                    "tgt": bar["call_target"],
+                    "stp": round(spot - fixed_sl_pts, 2),
+                    "cum": bar["call_cum_pts"], "iv_reg": iv_reg,
+                    "is_expiry": is_expiry, "entry_day_idx": date_idx,
+                })
+
+            if (direction_filter in ("BOTH","PUT only") and bar["put_signal"]
+                    and bar["atm_neg1_pts"] > cascade_entry_threshold
+                    and not any(p["direction"]=="PUT" for p in open_positions)):
+                open_positions.append({
+                    "direction": "PUT", "entry_date": trade_date,
+                    "entry_ts": ts, "entry_price": spot,
+                    "tgt": bar["put_target"],
+                    "stp": round(spot + fixed_sl_pts, 2),
+                    "cum": bar["put_cum_pts"], "iv_reg": iv_reg,
+                    "is_expiry": is_expiry, "entry_day_idx": date_idx,
+                })
+
+    # Force-close any positions still open at end of data
+    for pos in open_positions:
+        # Use last known eod_spot
+        if pos["direction"] == "CALL": pts = eod_spot - pos["entry_price"]
+        else:                          pts = pos["entry_price"] - eod_spot
+        trades.append(_mk_v3(
+            symbol, pos["entry_date"], pos["entry_ts"], all_dates[-1] + " EOD",
+            pos["direction"], pos["entry_price"], eod_spot, pts,
+            pos["tgt"], pos["stp"], "DATA_END_EXIT",
+            eod_iv, pos["cum"], pos["is_expiry"], expiry_flag,
+            lots, contract_size, "CNC"))
 
     return trades
 
-
-def _mk_strike(symbol, trade_date, entry_ts, exit_ts, direction,
-               entry_px, exit_px, pts, tgt, stp,
-               reason, iv_reg, cascade_cum_pts, is_expiry, expiry_flag):
-    """
-    Trade record builder.
-    bear_quality  → stores cumulative cascade pts (ATM±1+2+3) for display.
-    signal_strength → same value for chart compatibility.
-    """
+# ── Trade record builder ──────────────────────────────────────────────────────
+def _mk_v3(symbol, trade_date, entry_ts, exit_ts, direction,
+           entry_px, exit_px, pts, tgt, stp,
+           reason, iv_reg, cascade_cum_pts, is_expiry, expiry_flag,
+           lots, contract_size, bt_mode):
+    pnl_per_lot = round(pts * contract_size, 2)
     return {
         "symbol":          symbol,
         "trade_date":      trade_date,
         "entry_time":      str(entry_ts),
         "exit_time":       str(exit_ts),
-        "direction":       direction,        # "CALL" or "PUT"
+        "direction":       direction,
         "entry_price":     round(entry_px, 2),
         "exit_price":      round(exit_px, 2),
         "pts_captured":    round(pts, 2),
+        "pnl_per_lot":     pnl_per_lot,         # pts × contract_size (₹ per lot)
         "cascade_target":  round(tgt, 2),
         "cascade_stop":    round(stp, 2),
         "exit_reason":     reason,
-        "bear_quality":    round(cascade_cum_pts, 2),   # cascade cum pts
+        "bear_quality":    round(cascade_cum_pts, 2),
         "bull_quality":    0.0,
         "iv_regime":       iv_reg,
         "signal_strength": round(cascade_cum_pts, 2),
         "is_expiry_day":   int(is_expiry),
         "expiry_flag":     expiry_flag,
+        "bt_mode":         bt_mode,
     }
 
-# ── Metrics ───────────────────────────────────────────────────────────────────
-def compute_metrics(trades):
-    if trades.empty: return {}
-    pts=trades["pts_captured"]; wins=pts[pts>0]; losses=pts[pts<=0]
-    total=len(trades); hit=len(wins)/total*100 if total else 0
-    pf=(wins.sum()/abs(losses.sum())) if losses.sum()!=0 else float("inf")
-    cum=pts.cumsum(); dd=(cum.cummax()-cum).max()
-    sh=(pts.mean()/pts.std()*np.sqrt(250)) if pts.std()>0 else 0
-    neg=pts[pts<0].std()
-    so=(pts.mean()/neg*np.sqrt(250)) if neg and neg>0 else 0
-    t2=trades.copy()
-    t2["tm"]=abs(t2["cascade_target"]-t2["entry_price"])
-    t2["am"]=abs(t2["pts_captured"])
-    ca=(t2["am"]>=t2["tm"]*0.7).mean()*100
-    return {"total_trades":total,"hit_rate":round(hit,1),"total_pts":round(pts.sum(),1),
-            "avg_win":round(wins.mean(),1) if len(wins) else 0,
-            "avg_loss":round(losses.mean(),1) if len(losses) else 0,
-            "profit_factor":round(pf,2),"max_drawdown":round(dd,1),
-            "sharpe":round(sh,2),"sortino":round(so,2),"cascade_accuracy":round(ca,1),
-            "expiry_trades":int(trades["is_expiry_day"].sum()),
-            "expiry_pts":round(trades[trades["is_expiry_day"]==1]["pts_captured"].sum(),1),
-            "non_expiry_pts":round(trades[trades["is_expiry_day"]==0]["pts_captured"].sum(),1)}
+# ── Legacy wrapper kept for backward compat ───────────────────────────────────
+def run_backtest_for_day(signals, symbol, trade_date, expiry_flag,
+                         min_quality, require_iv,
+                         cascade_entry_threshold=50.0, max_target_pts=200.0,
+                         fixed_sl_pts=50.0, direction_filter="BOTH",
+                         max_trades_per_day=2, df_day=None, iv_df=None,
+                         lots=1):
+    if df_day is None or df_day.empty: return []
+    contract_size = INDEX_CONFIG.get(symbol,{}).get("contract_size",25)
+    if iv_df is None: iv_df = compute_iv_regime_series(df_day)
+    return run_intraday_day(df_day, symbol, trade_date, expiry_flag,
+                            cascade_entry_threshold, max_target_pts, fixed_sl_pts,
+                            direction_filter, max_trades_per_day, lots, iv_df)
 
-# ── Charts ────────────────────────────────────────────────────────────────────
+# ── Metrics ───────────────────────────────────────────────────────────────────
+def compute_metrics(trades, contract_size=25, lots=1):
+    if trades.empty: return {}
+    pts   = trades["pts_captured"]
+    pnl   = trades["pnl_per_lot"] if "pnl_per_lot" in trades.columns else pts * contract_size
+    wins  = pts[pts>0]; losses = pts[pts<=0]
+    total = len(trades); hit = len(wins)/total*100 if total else 0
+    pf    = (wins.sum()/abs(losses.sum())) if losses.sum()!=0 else float("inf")
+    cum   = pts.cumsum(); dd = (cum.cummax()-cum).max()
+    sh    = (pts.mean()/pts.std()*np.sqrt(250)) if pts.std()>0 else 0
+    neg   = pts[pts<0].std()
+    so    = (pts.mean()/neg*np.sqrt(250)) if neg and neg>0 else 0
+    t2    = trades.copy()
+    t2["tm"] = abs(t2["cascade_target"]-t2["entry_price"])
+    t2["am"] = abs(t2["pts_captured"])
+    ca    = (t2["am"]>=t2["tm"]*0.7).mean()*100
+    return {
+        "total_trades":    total,
+        "hit_rate":        round(hit,1),
+        "total_pts":       round(pts.sum(),1),
+        "total_pnl":       round(pnl.sum(),1),
+        "avg_pts_win":     round(wins.mean(),1) if len(wins) else 0,
+        "avg_pts_loss":    round(losses.mean(),1) if len(losses) else 0,
+        "avg_pnl_win":     round((pnl[pts>0]).mean(),1) if len(wins) else 0,
+        "avg_pnl_loss":    round((pnl[pts<=0]).mean(),1) if len(losses) else 0,
+        "profit_factor":   round(pf,2),
+        "max_drawdown":    round(dd,1),
+        "sharpe":          round(sh,2),
+        "sortino":         round(so,2),
+        "cascade_accuracy":round(ca,1),
+        "expiry_trades":   int(trades["is_expiry_day"].sum()),
+        "expiry_pts":      round(trades[trades["is_expiry_day"]==1]["pts_captured"].sum(),1),
+        "non_expiry_pts":  round(trades[trades["is_expiry_day"]==0]["pts_captured"].sum(),1),
+    }
+
+# ── Chart helpers ─────────────────────────────────────────────────────────────
 def equity_curve_chart(trades):
     t=trades.copy().reset_index(drop=True); t["cum"]=t["pts_captured"].cumsum()
     fig=make_subplots(rows=2,cols=1,shared_xaxes=True,row_heights=[0.65,0.35],
-                      subplot_titles=["Equity Curve (Cumulative Pts)","Per-Trade P&L"])
+                      subplot_titles=["Equity Curve (Cumulative Pts)","Per-Trade P&L (pts)"])
     fig.add_trace(go.Scatter(x=t.index,y=t["cum"],mode="lines",
-        line=dict(color="#00f5c4",width=2.5),fill="tozeroy",fillcolor="rgba(0,245,196,0.08)"),row=1,col=1)
+        line=dict(color="#00f5c4",width=2.5),fill="tozeroy",
+        fillcolor="rgba(0,245,196,0.08)"),row=1,col=1)
     fig.add_trace(go.Bar(x=t.index,y=t["pts_captured"],
         marker_color=t["pts_captured"].apply(lambda x:"#10b981" if x>0 else "#ef4444")),row=2,col=1)
     fig.update_layout(template="plotly_dark",height=500,paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(10,10,20,0.95)",showlegend=False,margin=dict(l=0,r=0,t=30,b=0))
     return fig
 
-def quality_vs_pts_chart(trades):
-    colors=trades["pts_captured"].apply(lambda x:"#10b981" if x>0 else "#ef4444")
-    fig=go.Figure(go.Scatter(x=trades["signal_strength"],y=trades["pts_captured"],
-        mode="markers",marker=dict(color=colors,size=8,opacity=0.75),
-        text=trades["trade_date"]+" "+trades["direction"],
-        hovertemplate="<b>%{text}</b><br>Cascade Pts:%{x:.1f}<br>P&L:%{y:.1f}pts<extra></extra>"))
-    fig.update_layout(template="plotly_dark",height=380,paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(10,10,20,0.95)",xaxis_title="Cumulative Cascade Pts",
-        yaxis_title="Pts Captured",margin=dict(l=0,r=0,t=10,b=0))
-    return fig
-
-def iv_regime_breakdown_chart(trades):
-    grp=trades.groupby("iv_regime")["pts_captured"].agg(["sum","count","mean"]).reset_index()
-    colors={"EXPANDING":"#ef4444","COMPRESSING":"#10b981","FLAT":"#94a3b8"}
-    fig=go.Figure(go.Bar(x=grp["iv_regime"],y=grp["sum"],
-        marker_color=[colors.get(r,"#8b5cf6") for r in grp["iv_regime"]],
-        text=[f"{row['count']} trades" for _,row in grp.iterrows()],
-        textposition="outside"))
-    fig.update_layout(template="plotly_dark",height=320,paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(10,10,20,0.95)",yaxis_title="Total Pts",margin=dict(l=0,r=0,t=10,b=0))
-    return fig
-
-def exit_reason_chart(trades):
-    grp=trades.groupby("exit_reason")["pts_captured"].agg(["sum","count"]).reset_index()
-    cm={"TARGET_HIT":"#10b981","STOP_HIT":"#ef4444",
-        "EOD_EXIT":"#f59e0b","TRAIL_STOP":"#f97316"}
-    fig=go.Figure(go.Bar(x=grp["exit_reason"],y=grp["sum"],
-        marker_color=[cm.get(r,"#8b5cf6") for r in grp["exit_reason"]],
-        text=grp["count"].apply(lambda x: f"{x} trades"),textposition="outside"))
-    fig.update_layout(template="plotly_dark",height=300,paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(10,10,20,0.95)",yaxis_title="Total Pts",margin=dict(l=0,r=0,t=10,b=0))
+def pnl_lot_chart(trades):
+    t=trades.copy().reset_index(drop=True)
+    if "pnl_per_lot" not in t.columns: t["pnl_per_lot"]=0.0
+    t["cum_pnl"]=t["pnl_per_lot"].cumsum()
+    fig=make_subplots(rows=2,cols=1,shared_xaxes=True,row_heights=[0.65,0.35],
+                      subplot_titles=["Cumulative P&L per Lot (₹)","Per-Trade P&L per Lot (₹)"])
+    fig.add_trace(go.Scatter(x=t.index,y=t["cum_pnl"],mode="lines",
+        line=dict(color="#a78bfa",width=2.5),fill="tozeroy",
+        fillcolor="rgba(167,139,250,0.08)"),row=1,col=1)
+    fig.add_trace(go.Bar(x=t.index,y=t["pnl_per_lot"],
+        marker_color=t["pnl_per_lot"].apply(lambda x:"#10b981" if x>0 else "#ef4444")),row=2,col=1)
+    fig.update_layout(template="plotly_dark",height=500,paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(10,10,20,0.95)",showlegend=False,margin=dict(l=0,r=0,t=30,b=0))
     return fig
 
 def direction_breakdown_chart(trades):
-    """New: CALL vs PUT performance breakdown."""
     grp=trades.groupby("direction")["pts_captured"].agg(["sum","count","mean"]).reset_index()
     cm={"CALL":"#00d4ff","PUT":"#a78bfa"}
     fig=go.Figure(go.Bar(x=grp["direction"],y=grp["sum"],
@@ -857,23 +924,224 @@ def direction_breakdown_chart(trades):
         textposition="outside"))
     fig.update_layout(template="plotly_dark",height=300,paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(10,10,20,0.95)",yaxis_title="Total Pts",
-        title_text="CALL vs PUT Breakdown",margin=dict(l=0,r=0,t=30,b=0))
+        title_text="CALL vs PUT",margin=dict(l=0,r=0,t=30,b=0))
     return fig
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+def exit_reason_chart(trades):
+    grp=trades.groupby("exit_reason")["pts_captured"].agg(["sum","count"]).reset_index()
+    cm={"TARGET_HIT":"#10b981","STOP_HIT":"#ef4444","EOD_EXIT":"#f59e0b",
+        "MAX_HOLD_EXIT":"#f97316","DATA_END_EXIT":"#6b7280","TRAIL_STOP":"#fb923c"}
+    fig=go.Figure(go.Bar(x=grp["exit_reason"],y=grp["sum"],
+        marker_color=[cm.get(r,"#8b5cf6") for r in grp["exit_reason"]],
+        text=grp["count"].apply(lambda x: f"{x}"),textposition="outside"))
+    fig.update_layout(template="plotly_dark",height=300,paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(10,10,20,0.95)",yaxis_title="Total Pts",margin=dict(l=0,r=0,t=10,b=0))
+    return fig
+
+def monthly_pnl_chart(trades):
+    trades=trades.copy()
+    trades["month"]=pd.to_datetime(trades["trade_date"]).dt.to_period("M").astype(str)
+    mo=trades.groupby("month")["pts_captured"].agg(["sum","count"]).reset_index()
+    fig=go.Figure(go.Bar(x=mo["month"],y=mo["sum"],
+        marker_color=mo["sum"].apply(lambda x:"#10b981" if x>0 else "#ef4444"),
+        text=mo["count"].apply(lambda x: f"{x} trades"),textposition="outside"))
+    fig.update_layout(template="plotly_dark",height=320,paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(10,10,20,0.95)",margin=dict(l=0,r=0,t=10,b=0))
+    return fig
+
+def iv_regime_breakdown_chart(trades):
+    grp=trades.groupby("iv_regime")["pts_captured"].agg(["sum","count","mean"]).reset_index()
+    colors={"EXPANDING":"#ef4444","COMPRESSING":"#10b981","FLAT":"#94a3b8"}
+    fig=go.Figure(go.Bar(x=grp["iv_regime"],y=grp["sum"],
+        marker_color=[colors.get(r,"#8b5cf6") for r in grp["iv_regime"]],
+        text=[f"{row['count']} trades" for _,row in grp.iterrows()],textposition="outside"))
+    fig.update_layout(template="plotly_dark",height=300,paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(10,10,20,0.95)",yaxis_title="Total Pts",margin=dict(l=0,r=0,t=10,b=0))
+    return fig
+
+# ── Trade table builder ───────────────────────────────────────────────────────
+def build_trade_table(trades, contract_size):
+    """Formatted trade table with Buy Price, Sell Price, P&L per lot."""
+    if trades.empty: return pd.DataFrame()
+    t = trades.copy()
+
+    # Buy / Sell labelling based on direction
+    t["Buy Price"]  = t.apply(lambda r: r["entry_price"] if r["direction"]=="CALL"
+                               else r["exit_price"], axis=1)
+    t["Sell Price"] = t.apply(lambda r: r["exit_price"] if r["direction"]=="CALL"
+                               else r["entry_price"], axis=1)
+
+    # P&L per lot in ₹
+    if "pnl_per_lot" not in t.columns:
+        t["pnl_per_lot"] = t["pts_captured"] * contract_size
+
+    t["P&L/Lot (₹)"] = t["pnl_per_lot"].apply(lambda x: f"{'▲' if x>=0 else '▼'} ₹{x:,.0f}")
+    t["Pts"]         = t["pts_captured"].apply(lambda x: f"{x:+.1f}")
+
+    # Entry/Exit times cleaned
+    def _ftime(ts_str):
+        try:    return pd.to_datetime(ts_str).strftime("%d-%b %H:%M")
+        except: return str(ts_str)[:16]
+
+    t["Entry Time"] = t["entry_time"].apply(_ftime)
+    t["Exit Time"]  = t["exit_time"].apply(_ftime)
+
+    disp = t[["trade_date","Entry Time","Exit Time","direction",
+               "Buy Price","Sell Price","Pts","P&L/Lot (₹)",
+               "cascade_target","cascade_stop","exit_reason","iv_regime","is_expiry_day"]].copy()
+    disp.columns = ["Date","Entry","Exit","Dir",
+                     "Buy (₹)","Sell (₹)","Pts","P&L/Lot",
+                     "Target","Stop","Exit","IV","Expiry"]
+    disp["Expiry"] = disp["Expiry"].map({0:"",1:"✓"})
+    return disp
+
+def style_trade_table(df):
+    def rc(row):
+        clr = "rgba(16,185,129,0.12)" if "▲" in str(row.get("P&L/Lot","")) \
+              else "rgba(239,68,68,0.10)"
+        return [f"background-color:{clr}"]*len(row)
+    return df.style.apply(rc, axis=1)
+
+# ── Metric card renderer ──────────────────────────────────────────────────────
+def render_kpi_row(kpis, cols):
+    for col,(label,val,cls) in zip(cols,kpis):
+        col.markdown(
+            f'<div class="metric-card"><div class="metric-val {cls}">{val}</div>'
+            f'<div class="metric-lbl">{label}</div></div>',
+            unsafe_allow_html=True)
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# RESULTS SECTION — full tabulated view
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def render_results_section(trades, symbol, mode_label, contract_size, lots):
+    if trades.empty:
+        st.info(f"No {mode_label} trades yet — run backtest in Tab 3 first.")
+        return
+
+    m = compute_metrics(trades, contract_size, lots)
+
+    # ── KPI rows ─────────────────────────────────────────────────────────
+    st.markdown(f"#### 📊 {mode_label} — Performance Summary")
+    cols = st.columns(5)
+    render_kpi_row([
+        ("Total Trades",  str(m["total_trades"]),           "n"),
+        ("Hit Rate",      f"{m['hit_rate']}%",              "g" if m["hit_rate"]>=50 else "r"),
+        ("Total Pts",     f"{m['total_pts']:+.1f}",         "g" if m["total_pts"]>0 else "r"),
+        ("Total P&L/Lot", f"₹{m['total_pnl']:,.0f}",       "g" if m["total_pnl"]>0 else "r"),
+        ("Profit Factor", f"{m['profit_factor']:.2f}x",    "g" if m["profit_factor"]>1 else "r"),
+    ], cols)
+
+    cols2 = st.columns(5)
+    render_kpi_row([
+        ("Avg Win Pts",   f"{m['avg_pts_win']:+.1f}",       "g"),
+        ("Avg Loss Pts",  f"{m['avg_pts_loss']:+.1f}",      "r"),
+        ("Avg Win/Lot",   f"₹{m['avg_pnl_win']:,.0f}",     "g"),
+        ("Avg Loss/Lot",  f"₹{m['avg_pnl_loss']:,.0f}",    "r"),
+        ("Max Drawdown",  f"{m['max_drawdown']:.1f} pts",   "r"),
+    ], cols2)
+
+    cols3 = st.columns(5)
+    render_kpi_row([
+        ("Sharpe",        f"{m['sharpe']:.2f}",             "g" if m["sharpe"]>1 else "n"),
+        ("Sortino",       f"{m['sortino']:.2f}",            "g" if m["sortino"]>1 else "n"),
+        ("Cascade Acc.",  f"{m['cascade_accuracy']:.1f}%",  "g" if m["cascade_accuracy"]>60 else "n"),
+        ("Expiry Pts",    f"{m['expiry_pts']:+.1f}",        "g" if m["expiry_pts"]>0 else "r"),
+        ("Non-Exp Pts",   f"{m['non_expiry_pts']:+.1f}",   "g" if m["non_expiry_pts"]>0 else "r"),
+    ], cols3)
+
+    # ── Sub-tabs ─────────────────────────────────────────────────────────
+    st.markdown("---")
+    rt1, rt2, rt3, rt4, rt5 = st.tabs([
+        "📈 Charts", "📋 All Trades", "📗 CALL Trades", "📕 PUT Trades", "📅 Monthly"])
+
+    with rt1:
+        c1, c2 = st.columns(2)
+        with c1: st.plotly_chart(equity_curve_chart(trades), use_container_width=True)
+        with c2: st.plotly_chart(pnl_lot_chart(trades), use_container_width=True)
+        c3, c4 = st.columns(2)
+        with c3: st.plotly_chart(direction_breakdown_chart(trades), use_container_width=True)
+        with c4: st.plotly_chart(exit_reason_chart(trades), use_container_width=True)
+        c5, c6 = st.columns(2)
+        with c5: st.plotly_chart(iv_regime_breakdown_chart(trades), use_container_width=True)
+        with c6: st.plotly_chart(monthly_pnl_chart(trades), use_container_width=True)
+
+    with rt2:
+        st.markdown(f"**All {mode_label} Trades** — {len(trades)} total")
+        tbl = build_trade_table(trades, contract_size)
+        st.dataframe(style_trade_table(tbl), use_container_width=True, height=600, hide_index=True)
+        st.download_button(
+            f"📥 Download {mode_label} CSV",
+            data=trades.to_csv(index=False),
+            file_name=f"hedgex_{symbol}_{mode_label.lower()}.csv",
+            mime="text/csv", use_container_width=True)
+
+    with rt3:
+        calls = trades[trades["direction"]=="CALL"]
+        st.markdown(f"**CALL Trades** — {len(calls)} total")
+        if not calls.empty:
+            tbl = build_trade_table(calls, contract_size)
+            st.dataframe(style_trade_table(tbl), use_container_width=True, height=500, hide_index=True)
+            cm = compute_metrics(calls, contract_size, lots)
+            st.markdown(
+                f'<div class="info-box">CALL Hit Rate: <b>{cm["hit_rate"]}%</b> &nbsp;|&nbsp; '
+                f'Total Pts: <b>{cm["total_pts"]:+.1f}</b> &nbsp;|&nbsp; '
+                f'P&L/Lot: <b>₹{cm["total_pnl"]:,.0f}</b></div>',
+                unsafe_allow_html=True)
+        else:
+            st.info("No CALL trades in this run.")
+
+    with rt4:
+        puts = trades[trades["direction"]=="PUT"]
+        st.markdown(f"**PUT Trades** — {len(puts)} total")
+        if not puts.empty:
+            tbl = build_trade_table(puts, contract_size)
+            st.dataframe(style_trade_table(tbl), use_container_width=True, height=500, hide_index=True)
+            pm = compute_metrics(puts, contract_size, lots)
+            st.markdown(
+                f'<div class="info-box">PUT Hit Rate: <b>{pm["hit_rate"]}%</b> &nbsp;|&nbsp; '
+                f'Total Pts: <b>{pm["total_pts"]:+.1f}</b> &nbsp;|&nbsp; '
+                f'P&L/Lot: <b>₹{pm["total_pnl"]:,.0f}</b></div>',
+                unsafe_allow_html=True)
+        else:
+            st.info("No PUT trades in this run.")
+
+    with rt5:
+        trades2 = trades.copy()
+        trades2["Month"] = pd.to_datetime(trades2["trade_date"]).dt.to_period("M").astype(str)
+        mo_grp = trades2.groupby("Month").agg(
+            Trades=("pts_captured","count"),
+            Pts=("pts_captured","sum"),
+            PnL_per_Lot=("pnl_per_lot","sum"),
+            Wins=("pts_captured", lambda x: (x>0).sum()),
+            Losses=("pts_captured", lambda x: (x<=0).sum()),
+        ).reset_index()
+        mo_grp["Hit%"]   = (mo_grp["Wins"]/mo_grp["Trades"]*100).round(1)
+        mo_grp["Pts"]    = mo_grp["Pts"].round(1)
+        mo_grp["P&L (₹)"]= mo_grp["PnL_per_Lot"].apply(lambda x: f"₹{x:,.0f}")
+        mo_grp["Result"] = mo_grp["Pts"].apply(lambda x: "🟢" if x>0 else "🔴")
+        disp_mo = mo_grp[["Month","Result","Trades","Wins","Losses","Hit%","Pts","P&L (₹)"]].copy()
+        st.dataframe(disp_mo, use_container_width=True, hide_index=True)
+        st.plotly_chart(monthly_pnl_chart(trades), use_container_width=True)
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# MAIN
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 def main():
     init_db()
 
     st.markdown("""<div class="bt-header">
         <div class="bt-title">HedGEX — Cascade Backtest Engine</div>
         <div class="bt-sub">Strike-Level Custom Strategy &nbsp;·&nbsp;
-        ATM±1 Cascade Trigger &nbsp;·&nbsp; Powered by Dhan Rolling Option API</div>
+        Intraday &amp; CNC Modes &nbsp;·&nbsp; Powered by Dhan Rolling Option API v2</div>
     </div>""", unsafe_allow_html=True)
 
+    # ── Sidebar ───────────────────────────────────────────────────────────────
     with st.sidebar:
         st.markdown("### ⚙️ Configuration")
         st.markdown(
-            f'<div class="info-box">Client: <b>1100480354</b><br>Token: <b>Hardcoded</b></div>',
+            '<div class="info-box">Client: <b>1100480354</b><br>Token: <b>Hardcoded</b></div>',
             unsafe_allow_html=True)
         st.markdown("---")
         symbol      = st.selectbox("Index", list(INDEX_CONFIG.keys()), index=0)
@@ -884,63 +1152,41 @@ def main():
                                    format_func=lambda x: f"{x} min")
         st.markdown("---")
         st.markdown("### 📅 Date Range")
-        today  = date.today()
-        d_end  = st.date_input("End Date",   value=today-timedelta(days=1))
-        d_start= st.date_input("Start Date", value=today-timedelta(days=365))
+        today   = date.today()
+        d_end   = st.date_input("End Date",   value=today-timedelta(days=1))
+        d_start = st.date_input("Start Date", value=today-timedelta(days=365))
         st.markdown("---")
         st.markdown("### ⚡ Strikes")
-        n_strikes = st.slider("ATM ± N", 3, 10, 5)
+        n_strikes   = st.slider("ATM ± N", 3, 10, 5)
         all_strikes = (["ATM"]
                        +[f"ATM+{i}" for i in range(1,n_strikes+1)]
                        +[f"ATM-{i}" for i in range(1,n_strikes+1)])
         st.caption(f"{len(all_strikes)} strikes selected")
         st.markdown("---")
 
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # CUSTOM STRATEGY PARAMETERS
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # ── Strategy parameters ───────────────────────────────────────────
         st.markdown("### 🎯 Strike-Level Strategy")
         st.markdown(
             '<div class="info-box">'
-            '📈 <b>CALL</b>: IV Expanding + ATM+1 cascade &gt; trigger → BUY ATM+1 Call<br>'
-            '&nbsp;&nbsp;&nbsp;&nbsp;Target = min(ATM+1+2+3 cascade, max target)<br>'
-            '📉 <b>PUT &nbsp;</b>: IV Expanding + ATM-1 cascade &gt; trigger → BUY ATM-1 Put<br>'
-            '&nbsp;&nbsp;&nbsp;&nbsp;Target = min(ATM-1+2+3 cascade, max target)<br>'
-            '🛑 Stop Loss = fixed pts from entry spot'
-            '</div>',
-            unsafe_allow_html=True)
+            '📈 <b>CALL</b>: IV Expanding + ATM+1 cascade &gt; trigger<br>'
+            '📉 <b>PUT</b>: IV Expanding + ATM-1 cascade &gt; trigger<br>'
+            'Target = min(ATM±1+2+3, max) &nbsp;|&nbsp; SL = fixed pts'
+            '</div>', unsafe_allow_html=True)
 
-        st.markdown("**Entry**")
-        cascade_entry_threshold = st.slider(
-            "ATM±1 Cascade Trigger (pts)", 10, 200, 50, 5,
-            help="Entry fires when abs(net_gex × pts_per_unit) at ATM+1 or ATM-1 exceeds this value.")
+        cascade_entry_threshold = st.slider("ATM±1 Cascade Trigger (pts)", 10, 200, 50, 5)
+        max_target_pts          = st.slider("Max Target (pts)", 50, 500, 200, 25)
+        fixed_sl_pts            = st.slider("Stop Loss (pts)", 10, 200, 50, 5)
+        direction_filter        = st.selectbox("Direction", ["BOTH","CALL only","PUT only"])
+        lots                    = st.number_input("Lots", min_value=1, max_value=100, value=1, step=1)
+        max_trades_per_day      = st.selectbox("Max Trades/Day", [1,2,3,5,99], index=1,
+                                               format_func=lambda x: str(x) if x<99 else "Unlimited")
 
-        st.markdown("**Target**")
-        max_target_pts = st.slider(
-            "Max Target (pts)", 50, 500, 200, 25,
-            help="Cumulative cascade (ATM±1 through ATM±3) capped at this value.")
+        # CNC extra
+        st.markdown("**CNC Settings**")
+        max_hold_days = st.slider("Max Hold Days (CNC)", 1, 30, 5, 1,
+                                  help="Force-close CNC position after this many trading days.")
 
-        st.markdown("**Stop Loss**")
-        fixed_sl_pts = st.slider(
-            "Stop Loss (pts)", 10, 200, 50, 5,
-            help="Fixed stop loss in points from entry spot price.")
-
-        st.markdown("**Direction**")
-        direction_filter = st.selectbox(
-            "Allow Trades",
-            options=["BOTH", "CALL only", "PUT only"],
-            index=0,
-            help="Restrict to one direction or allow both simultaneously.")
-
-        st.markdown("**Max Trades / Day**")
-        max_trades_per_day = st.selectbox(
-            "Max Trades Per Day",
-            options=[1, 2, 3, 5, 99],
-            index=1,
-            format_func=lambda x: str(x) if x < 99 else "Unlimited",
-            help="Combined CALL + PUT count. Stops new entries once limit is reached.")
-
-        # Legacy aliases (used in a few display strings only)
+        # Legacy aliases
         min_quality = cascade_entry_threshold / 100.0
         require_iv  = True
 
@@ -948,23 +1194,34 @@ def main():
         st.markdown("### 🗄️ Database")
         stats = db_stats()
         st.markdown(
-            '<div class="info-box">Raw rows: <b>' + str(stats["raw_rows"]) + '</b><br>'
-            'Days: <b>' + str(stats["days"]) + '</b><br>Signals: <b>' + str(stats["signals"]) + '</b><br>'
-            'Trades: <b>' + str(stats["trades"]) + '</b></div>',
-            unsafe_allow_html=True)
-        if st.button("🗑️ Clear Trades", use_container_width=True):
-            clear_trades(symbol); st.success("Trades cleared"); st.rerun()
+            '<div class="info-box">'
+            f'Raw rows: <b>{stats["raw_rows"]}</b><br>'
+            f'Days: <b>{stats["days"]}</b><br>'
+            f'Signals: <b>{stats["signals"]}</b><br>'
+            f'Intraday trades: <b>{stats["trades_intraday"]}</b><br>'
+            f'CNC trades: <b>{stats["trades_cnc"]}</b>'
+            '</div>', unsafe_allow_html=True)
 
-    tab_fetch, tab_signals, tab_bt, tab_results, tab_trades = st.tabs([
-        "1️⃣ Fetch Data","2️⃣ Compute Signals","3️⃣ Run Backtest","4️⃣ Results","5️⃣ Trade Log"])
+    # ── Tabs ──────────────────────────────────────────────────────────────────
+    (tab_fetch, tab_signals, tab_intraday, tab_cnc,
+     tab_res_intraday, tab_res_cnc, tab_data_mgmt) = st.tabs([
+        "1️⃣ Fetch Data",
+        "2️⃣ Compute Signals",
+        "3️⃣ Run Intraday BT",
+        "4️⃣ Run CNC BT",
+        "5️⃣ Intraday Results",
+        "6️⃣ CNC Results",
+        "🗄️ Data Management",
+    ])
 
     # ── Tab 1: Fetch ──────────────────────────────────────────────────────────
     with tab_fetch:
         st.markdown("### 📡 Fetch Historical Options Chain")
-        st.markdown('<div class="info-box">Calls <code>POST /v2/charts/rollingoption</code> for each strike. '
-                    "Data stored in SQLite. Already-fetched days skipped automatically. "
-                    "Checkpoints after every strike — safe to resume if interrupted.</div>",
-                    unsafe_allow_html=True)
+        st.markdown(
+            '<div class="info-box">Calls <code>POST /v2/charts/rollingoption</code> for each strike. '
+            'Data stored in SQLite. Already-fetched days skipped. '
+            'Checkpoints after every strike — safe to resume if interrupted.</div>',
+            unsafe_allow_html=True)
 
         ckpt = checkpoint_status()
         if ckpt:
@@ -972,7 +1229,7 @@ def main():
                 '<div class="warn-box">⚡ Checkpoint — '
                 + str(ckpt.get("trade_date","?")) + " | "
                 + str(len(ckpt.get("completed_strikes",[]))) + " strikes done | "
-                + str(len(ckpt.get("partial_rows",[]))) + " rows saved. Next fetch resumes.</div>",
+                + str(len(ckpt.get("partial_rows",[]))) + " rows saved.</div>",
                 unsafe_allow_html=True)
             if st.button("🗑️ Discard Checkpoint"):
                 clear_checkpoint(); st.rerun()
@@ -981,12 +1238,13 @@ def main():
         done_dates    = get_fetch_log(symbol, expiry_code, expiry_flag)
         pending       = [d for d in trading_dates if d not in done_dates]
         c1,c2,c3 = st.columns(3)
-        c1.metric("Total days",     len(trading_dates))
-        c2.metric("Fetched",        len(done_dates))
-        c3.metric("Pending",        len(pending))
+        c1.metric("Total days", len(trading_dates))
+        c2.metric("Fetched",    len(done_dates))
+        c3.metric("Pending",    len(pending))
         if pending:
             est = len(pending)*len(all_strikes)*2*0.35/60
-            st.markdown(f'<div class="warn-box">Estimated time: ~{est:.1f} min</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="warn-box">Estimated time: ~{est:.1f} min</div>',
+                        unsafe_allow_html=True)
 
         fetch_btn = st.button(f"🚀 Fetch {len(pending)} Days", type="primary",
                               use_container_width=True, disabled=(len(pending)==0))
@@ -994,20 +1252,20 @@ def main():
             overall=st.progress(0); day_bar=st.progress(0)
             status=st.empty(); day_status=st.empty(); log_box=st.empty()
             log_lines=[]
-            for idx,trade_date in enumerate(pending):
+            for idx, trade_date in enumerate(pending):
                 day_status.text(f"Day {idx+1}/{len(pending)}: {trade_date}")
                 ckpt_now = checkpoint_status()
                 if ckpt_now and ckpt_now.get("trade_date") != trade_date:
                     clear_checkpoint()
                 try:
-                    n = fetch_one_day(symbol,trade_date,all_strikes,interval,
-                                      expiry_code,expiry_flag,day_bar,status)
-                    log_fetch(symbol,trade_date,expiry_code,expiry_flag,"ok",n)
+                    n = fetch_one_day(symbol, trade_date, all_strikes, interval,
+                                      expiry_code, expiry_flag, day_bar, status)
+                    log_fetch(symbol, trade_date, expiry_code, expiry_flag, "ok", n)
                     log_lines.append(f"✅ {trade_date} — {n:,} rows")
                     if n == 0:
-                        log_lines.append(f"   ⚠️ 0 rows — check expiry_code or try adjacent date")
+                        log_lines.append("   ⚠️ 0 rows — check expiry_code/date")
                 except Exception as e:
-                    log_lines.append(f"⚠️ {trade_date} — {e} (checkpoint saved)")
+                    log_lines.append(f"⚠️ {trade_date} — {e}")
                     log_box.text("\n".join(log_lines[-15:]))
                     st.warning(f"Interrupted at {trade_date}. Restart to resume.")
                     break
@@ -1015,7 +1273,6 @@ def main():
                 log_box.text("\n".join(log_lines[-15:]))
             overall.empty(); day_bar.empty(); status.empty(); day_status.empty()
 
-        # API Inspector
         with st.expander("🔬 API Response Inspector"):
             dc1,dc2,dc3 = st.columns(3)
             dbg_date   = dc1.text_input("Test Date", value=str(date.today()-timedelta(days=5)))
@@ -1031,8 +1288,9 @@ def main():
                                            silent=False)
                 if raw:
                     ce = raw.get("ce",{}); ts_list = ce.get("timestamp",[])
-                    match = [t for t in ts_list if datetime.fromtimestamp(t,tz=pytz.UTC).astimezone(IST).date()==dbg_dt]
-                    st.success(f"✅ ce keys: {list(ce.keys())} | {len(ts_list)} timestamps | {len(match)} match {dbg_date}")
+                    match = [t for t in ts_list
+                             if datetime.fromtimestamp(t,tz=pytz.UTC).astimezone(IST).date()==dbg_dt]
+                    st.success(f"✅ {len(ts_list)} timestamps | {len(match)} match {dbg_date}")
                     if ts_list:
                         show=ts_list[:8]
                         st.dataframe(pd.DataFrame({
@@ -1042,37 +1300,30 @@ def main():
                             "oi":ce.get("oi",[])[:8],"iv":ce.get("iv",[])[:8],
                         }), hide_index=True, use_container_width=True)
                 else:
-                    st.error("Empty response. Check token or try different expiry_code.")
+                    st.error("Empty response.")
 
-        # Strike type verifier
-        with st.expander("🔎 Verify Strike Type Labels in DB"):
-            st.markdown(
-                '<div class="info-box">Run this to confirm your DB stores strike labels '
-                'as ATM+1, ATM+2 etc. The strategy reads these labels directly.</div>',
-                unsafe_allow_html=True)
+        with st.expander("🔎 Verify Strike Labels in DB"):
             if st.button("Check strike_type values", key="stcheck"):
                 con = sqlite3.connect(DB_PATH)
                 df_st = pd.read_sql_query(
                     "SELECT DISTINCT strike_type FROM raw_chain WHERE symbol=? LIMIT 30",
-                    con, params=(symbol,))
-                con.close()
+                    con, params=(symbol,)); con.close()
                 if df_st.empty:
-                    st.warning("No data in DB yet for this symbol.")
+                    st.warning("No data in DB yet.")
                 else:
                     st.dataframe(df_st, hide_index=True)
                     expected = {"ATM","ATM+1","ATM+2","ATM+3","ATM-1","ATM-2","ATM-3"}
-                    found    = set(df_st["strike_type"].tolist())
-                    missing  = expected - found
-                    if missing:
-                        st.warning(f"⚠️ Missing expected labels: {missing}")
-                    else:
-                        st.success("✅ All required strike labels present.")
+                    missing  = expected - set(df_st["strike_type"].tolist())
+                    if missing: st.warning(f"⚠️ Missing: {missing}")
+                    else:       st.success("✅ All required strike labels present.")
 
         if done_dates:
             st.markdown("#### ✅ Fetched Days")
             con=sqlite3.connect(DB_PATH)
             st.dataframe(pd.read_sql_query(
-                "SELECT trade_date,rows_fetched,fetched_at FROM fetch_log WHERE symbol=? AND expiry_code=? AND expiry_flag=? AND status='ok' ORDER BY trade_date DESC",
+                "SELECT trade_date,rows_fetched,fetched_at FROM fetch_log "
+                "WHERE symbol=? AND expiry_code=? AND expiry_flag=? AND status='ok' "
+                "ORDER BY trade_date DESC",
                 con,params=(symbol,expiry_code,expiry_flag)),
                 use_container_width=True,height=300,hide_index=True)
             con.close()
@@ -1081,30 +1332,29 @@ def main():
     with tab_signals:
         st.markdown("### ⚡ Compute Cascade Signals")
         st.markdown(
-            '<div class="info-box">Optional for the custom strategy — signals table is used '
-            'by the original cascade engine. The strike-level backtest (Tab 3) reads '
-            'raw_chain directly and does not require this step.</div>',
+            '<div class="info-box">Optional for the custom strategy — '
+            'the intraday/CNC backtests read raw_chain directly. '
+            'Compute signals here for the legacy cascade dashboard.</div>',
             unsafe_allow_html=True)
-        done_dates = get_fetch_log(symbol, expiry_code, expiry_flag)
+        done_dates_s = get_fetch_log(symbol, expiry_code, expiry_flag)
         con=sqlite3.connect(DB_PATH)
         sig_d=pd.read_sql_query("SELECT DISTINCT trade_date FROM cascade_signals WHERE symbol=?",
-                                con,params=(symbol,))
-        con.close()
-        sig_dates=set(sig_d["trade_date"].tolist()) if not sig_d.empty else set()
-        pending_sig=[d for d in sorted(done_dates) if d not in sig_dates]
-        c1,c2,c3=st.columns(3)
-        c1.metric("Fetched days",len(done_dates))
+                                con,params=(symbol,)); con.close()
+        sig_dates   = set(sig_d["trade_date"].tolist()) if not sig_d.empty else set()
+        pending_sig = [d for d in sorted(done_dates_s) if d not in sig_dates]
+        c1,c2,c3 = st.columns(3)
+        c1.metric("Fetched days", len(done_dates_s))
         c2.metric("Signals ready",len(sig_dates))
-        c3.metric("Pending",len(pending_sig))
+        c3.metric("Pending",      len(pending_sig))
 
-        if st.button(f"⚡ Compute Signals for {len(pending_sig)} Days",type="primary",
-                     use_container_width=True,disabled=(len(pending_sig)==0)):
+        if st.button(f"⚡ Compute Signals for {len(pending_sig)} Days", type="primary",
+                     use_container_width=True, disabled=(len(pending_sig)==0)):
             prog=st.progress(0); status=st.empty()
             for idx,trade_date in enumerate(pending_sig):
                 status.text(f"Computing {trade_date} ({idx+1}/{len(pending_sig)})")
-                df_day=load_raw_chain(symbol,trade_date,expiry_code,expiry_flag)
-                if not df_day.empty:
-                    save_signals(compute_signals_for_day(df_day,symbol,trade_date))
+                df_d=load_raw_chain(symbol,trade_date,expiry_code,expiry_flag)
+                if not df_d.empty:
+                    save_signals(compute_signals_for_day(df_d,symbol,trade_date))
                 prog.progress((idx+1)/len(pending_sig))
             prog.empty(); status.empty()
             st.success("✅ Signals computed"); st.rerun()
@@ -1118,150 +1368,241 @@ def main():
                                       "bear_fuel_pts","bear_absorb_pts"]],
                              use_container_width=True,height=300,hide_index=True)
 
-    # ── Tab 3: Run Backtest ───────────────────────────────────────────────────
-    with tab_bt:
-        st.markdown("### 🔄 Run Backtest")
+    # ── Tab 3: Run Intraday Backtest ──────────────────────────────────────────
+    with tab_intraday:
+        st.markdown("### 3️⃣ Run Intraday Backtest")
+        st.markdown(
+            '<div class="mode-intraday">'
+            '⚡ <b>INTRADAY MODE</b> — entry and exit within the same trading day.<br>'
+            'EOD forced exit if target/stop not hit. Suitable for options day-trading simulation.'
+            '</div>', unsafe_allow_html=True)
 
-        done_dates = get_fetch_log(symbol, expiry_code, expiry_flag)
-        all_bt_dates = sorted(done_dates)
+        done_dates_i = get_fetch_log(symbol, expiry_code, expiry_flag)
+        all_bt_dates = sorted(done_dates_i)
 
         st.markdown(
             '<div class="info-box">'
-            '📈 <b>CALL entry</b>: IV Expanding + ATM+1 cascade &gt; <b>'
-            + str(cascade_entry_threshold) + ' pts</b><br>'
-            '&nbsp;&nbsp;&nbsp;&nbsp;Target: min(ATM+1+2+3 cumulative, <b>'
-            + str(max_target_pts) + ' pts</b>) above entry<br>'
-            '📉 <b>PUT entry</b>: IV Expanding + ATM-1 cascade &gt; <b>'
-            + str(cascade_entry_threshold) + ' pts</b><br>'
-            '&nbsp;&nbsp;&nbsp;&nbsp;Target: min(ATM-1+2+3 cumulative, <b>'
-            + str(max_target_pts) + ' pts</b>) below entry<br>'
-            '🛑 Stop Loss: <b>' + str(fixed_sl_pts) + ' pts</b> &nbsp;|&nbsp;'
-            'Direction: <b>' + direction_filter + '</b> &nbsp;|&nbsp;'
-            'Max Trades/Day: <b>' + str(max_trades_per_day) + '</b> &nbsp;|&nbsp;'
-            'Days available: <b>' + str(len(all_bt_dates)) + '</b>'
-            '</div>',
-            unsafe_allow_html=True)
+            f'Trigger: <b>{cascade_entry_threshold} pts</b> &nbsp;|&nbsp; '
+            f'Max Target: <b>{max_target_pts} pts</b> &nbsp;|&nbsp; '
+            f'SL: <b>{fixed_sl_pts} pts</b> &nbsp;|&nbsp; '
+            f'Dir: <b>{direction_filter}</b> &nbsp;|&nbsp; '
+            f'Lots: <b>{lots}</b> &nbsp;|&nbsp; '
+            f'Days: <b>{len(all_bt_dates)}</b>'
+            '</div>', unsafe_allow_html=True)
 
-        if st.button(f"▶ Run Backtest on {len(all_bt_dates)} Days", type="primary",
-                     use_container_width=True, disabled=(len(all_bt_dates)==0)):
-            clear_trades(symbol)
+        contract_size = INDEX_CONFIG.get(symbol,{}).get("contract_size",25)
+        st.caption(f"Contract size: {contract_size} units/lot  ·  "
+                   f"P&L per 1pt move per lot = ₹{contract_size}")
+
+        col_run, col_clr = st.columns([3,1])
+        run_intra = col_run.button(f"▶ Run Intraday BT on {len(all_bt_dates)} Days",
+                                   type="primary", use_container_width=True,
+                                   disabled=(len(all_bt_dates)==0))
+        if col_clr.button("🗑️ Clear Intraday", use_container_width=True):
+            clear_trades(symbol, "INTRADAY"); st.success("Intraday trades cleared"); st.rerun()
+
+        if run_intra:
+            clear_trades(symbol, "INTRADAY")
             prog=st.progress(0); status=st.empty(); all_trades=[]
             for idx, td in enumerate(all_bt_dates):
                 status.text(f"Simulating {td} ({idx+1}/{len(all_bt_dates)})")
                 df_day = load_raw_chain(symbol, td, expiry_code, expiry_flag)
                 if not df_day.empty:
                     iv_df = compute_iv_regime_series(df_day)
-                    all_trades.extend(run_backtest_for_day(
-                        signals=None,
-                        symbol=symbol,
-                        trade_date=td,
-                        expiry_flag=expiry_flag,
-                        min_quality=min_quality,
-                        require_iv=require_iv,
-                        cascade_entry_threshold=cascade_entry_threshold,
-                        max_target_pts=max_target_pts,
-                        fixed_sl_pts=fixed_sl_pts,
-                        direction_filter=direction_filter,
-                        max_trades_per_day=max_trades_per_day,
-                        df_day=df_day,
-                        iv_df=iv_df))
+                    all_trades.extend(run_intraday_day(
+                        df_day, symbol, td, expiry_flag,
+                        cascade_entry_threshold, max_target_pts, fixed_sl_pts,
+                        direction_filter, max_trades_per_day, lots, iv_df))
                 prog.progress((idx+1)/len(all_bt_dates))
             save_trades(all_trades)
             prog.empty(); status.empty()
-            st.success(f"✅ Done — {len(all_trades)} trades"); st.rerun()
+            st.success(f"✅ Intraday done — {len(all_trades)} trades"); st.rerun()
 
-    # ── Tab 4: Results ────────────────────────────────────────────────────────
-    with tab_results:
-        st.markdown("### 📊 Results")
-        trades=load_trades(symbol)
-        if trades.empty:
-            st.info("No trades yet — run backtest in Tab 3 first.")
-        else:
-            m=compute_metrics(trades)
-            cols=st.columns(5)
-            kpis=[
-                ("Total Trades",  str(m["total_trades"]),        "n"),
-                ("Hit Rate",      str(m['hit_rate'])+'%',         "g" if m["hit_rate"]>=50 else "r"),
-                ("Total Pts",     f"{m['total_pts']:+.1f}",       "g" if m["total_pts"]>0  else "r"),
-                ("Profit Factor", f"{m['profit_factor']:.2f}x",  "g" if m["profit_factor"]>1 else "r"),
-                ("Max Drawdown",  f"{m['max_drawdown']:.1f} pts","r"),
-            ]
-            for col,(label,val,cls) in zip(cols,kpis):
-                col.markdown(
-                    '<div class="metric-card"><div class="metric-val ' + cls + '">' + str(val) + '</div>'
-                    '<div class="metric-lbl">' + label + '</div></div>',
-                    unsafe_allow_html=True)
+    # ── Tab 4: Run CNC Backtest ───────────────────────────────────────────────
+    with tab_cnc:
+        st.markdown("### 4️⃣ Run CNC / Positional Backtest")
+        st.markdown(
+            '<div class="mode-cnc">'
+            '📦 <b>CNC MODE</b> — positional / multi-day holding.<br>'
+            f'Entry on signal bar; exit at EOD when target/stop hit or after max <b>{max_hold_days}</b> days.<br>'
+            'Max 2 concurrent positions (1 CALL + 1 PUT). Suitable for swing options simulation.'
+            '</div>', unsafe_allow_html=True)
 
-            cols2=st.columns(5)
-            kpis2=[
-                ("Sharpe",         f"{m['sharpe']:.2f}",           "g" if m["sharpe"]>1  else "n"),
-                ("Sortino",        f"{m['sortino']:.2f}",          "g" if m["sortino"]>1 else "n"),
-                ("Cascade Acc.",   f"{m['cascade_accuracy']:.1f}%","g" if m["cascade_accuracy"]>60 else "n"),
-                ("Expiry Pts",     f"{m['expiry_pts']:+.1f}",      "g" if m["expiry_pts"]>0 else "r"),
-                ("Non-Expiry Pts", f"{m['non_expiry_pts']:+.1f}",  "g" if m["non_expiry_pts"]>0 else "r"),
-            ]
-            for col,(label,val,cls) in zip(cols2,kpis2):
-                col.markdown(
-                    '<div class="metric-card"><div class="metric-val ' + cls + '">' + str(val) + '</div>'
-                    + '<div class="metric-lbl">' + label + '</div></div>',
-                    unsafe_allow_html=True)
+        done_dates_c = get_fetch_log(symbol, expiry_code, expiry_flag)
+        all_cnc_dates = sorted(done_dates_c)
 
-            # Charts row 1
-            c1,c2=st.columns([2,1])
-            with c1: st.plotly_chart(equity_curve_chart(trades),use_container_width=True)
-            with c2: st.plotly_chart(direction_breakdown_chart(trades),use_container_width=True)
+        st.markdown(
+            '<div class="info-box">'
+            f'Trigger: <b>{cascade_entry_threshold} pts</b> &nbsp;|&nbsp; '
+            f'Max Target: <b>{max_target_pts} pts</b> &nbsp;|&nbsp; '
+            f'SL: <b>{fixed_sl_pts} pts</b> &nbsp;|&nbsp; '
+            f'Dir: <b>{direction_filter}</b> &nbsp;|&nbsp; '
+            f'Lots: <b>{lots}</b> &nbsp;|&nbsp; '
+            f'Max Hold: <b>{max_hold_days} days</b> &nbsp;|&nbsp; '
+            f'Days: <b>{len(all_cnc_dates)}</b>'
+            '</div>', unsafe_allow_html=True)
 
-            # Charts row 2
-            c3,c4=st.columns(2)
-            with c3: st.plotly_chart(quality_vs_pts_chart(trades),use_container_width=True)
-            with c4: st.plotly_chart(exit_reason_chart(trades),use_container_width=True)
+        contract_size = INDEX_CONFIG.get(symbol,{}).get("contract_size",25)
+        st.caption(f"Contract size: {contract_size} units/lot  ·  "
+                   f"P&L per 1pt move per lot = ₹{contract_size}")
 
-            # Charts row 3
-            c5,c6=st.columns(2)
-            with c5: st.plotly_chart(iv_regime_breakdown_chart(trades),use_container_width=True)
+        col_run2, col_clr2 = st.columns([3,1])
+        run_cnc = col_run2.button(f"▶ Run CNC BT on {len(all_cnc_dates)} Days",
+                                   type="primary", use_container_width=True,
+                                   disabled=(len(all_cnc_dates)==0))
+        if col_clr2.button("🗑️ Clear CNC", use_container_width=True):
+            clear_trades(symbol, "CNC"); st.success("CNC trades cleared"); st.rerun()
 
-            # Monthly P&L
-            st.markdown("#### 📅 Monthly P&L")
-            trades["month"]=pd.to_datetime(trades["trade_date"]).dt.to_period("M").astype(str)
-            mo=trades.groupby("month")["pts_captured"].agg(["sum","count"]).reset_index()
-            fig_m=go.Figure(go.Bar(x=mo["month"],y=mo["sum"],
-                marker_color=mo["sum"].apply(lambda x:"#10b981" if x>0 else "#ef4444"),
-                text=mo["count"].apply(lambda x: f"{x} trades"),textposition="outside"))
-            fig_m.update_layout(template="plotly_dark",height=300,
-                paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(10,10,20,0.95)",
-                margin=dict(l=0,r=0,t=10,b=0))
-            st.plotly_chart(fig_m,use_container_width=True)
+        if run_cnc:
+            clear_trades(symbol, "CNC")
+            status2 = st.empty(); prog2 = st.progress(0)
+            cnc_trades = run_cnc_backtest(
+                all_cnc_dates, symbol, expiry_flag, expiry_code,
+                cascade_entry_threshold, max_target_pts, fixed_sl_pts,
+                direction_filter, max_hold_days, lots, status2)
+            save_trades(cnc_trades)
+            prog2.progress(1.0); prog2.empty(); status2.empty()
+            st.success(f"✅ CNC done — {len(cnc_trades)} trades"); st.rerun()
 
-            st.download_button("📥 Download CSV",data=trades.to_csv(index=False),
-                file_name=f"hedgex_{symbol}.csv",mime="text/csv",use_container_width=True)
+    # ── Tab 5: Intraday Results ───────────────────────────────────────────────
+    with tab_res_intraday:
+        st.markdown("### 5️⃣ Intraday Results")
+        contract_size = INDEX_CONFIG.get(symbol,{}).get("contract_size",25)
+        trades_i = load_trades(symbol, "INTRADAY")
+        render_results_section(trades_i, symbol, "Intraday", contract_size, lots)
 
-    # ── Tab 5: Trade Log ──────────────────────────────────────────────────────
-    with tab_trades:
-        st.markdown("### 📋 Trade Log")
-        trades=load_trades(symbol)
-        if trades.empty:
-            st.info("No trades yet.")
-        else:
-            # Show cascade cum pts (stored in bear_quality column)
-            disp=trades[["trade_date","entry_time","exit_time","direction",
-                          "entry_price","exit_price","pts_captured",
-                          "cascade_target","cascade_stop","exit_reason",
-                          "bear_quality","iv_regime","is_expiry_day"]].copy()
-            disp.rename(columns={"bear_quality":"cascade_cum_pts"}, inplace=True)
-            disp["entry_time"]=pd.to_datetime(disp["entry_time"]).dt.strftime("%H:%M")
-            disp["exit_time"] =pd.to_datetime(disp["exit_time"]).dt.strftime("%H:%M")
-            disp["is_expiry_day"]=disp["is_expiry_day"].map({0:"",1:"Expiry"})
-            def rc(row):
-                if row["pts_captured"]>0: return ["background-color:rgba(16,185,129,0.12)"]*len(row)
-                return ["background-color:rgba(239,68,68,0.10)"]*len(row)
-            st.dataframe(disp.style.apply(rc,axis=1),
-                use_container_width=True,height=600,hide_index=True)
+    # ── Tab 6: CNC Results ────────────────────────────────────────────────────
+    with tab_res_cnc:
+        st.markdown("### 6️⃣ CNC Results")
+        contract_size = INDEX_CONFIG.get(symbol,{}).get("contract_size",25)
+        trades_c = load_trades(symbol, "CNC")
+        render_results_section(trades_c, symbol, "CNC", contract_size, lots)
 
+    # ── Tab 7: Data Management ────────────────────────────────────────────────
+    with tab_data_mgmt:
+        st.markdown("### 🗄️ Data Management")
+        st.markdown(
+            '<div class="danger-box">⚠️ Deletions are <b>permanent and irreversible</b>. '
+            'Raw chain data must be re-fetched from Dhan API after clearing.</div>',
+            unsafe_allow_html=True)
+
+        st.markdown("---")
+
+        # ── Section 1: Clear Trades ───────────────────────────────────────
+        st.markdown("#### 🗑️ Clear Backtest Trades")
+        dm_c1, dm_c2, dm_c3 = st.columns(3)
+
+        with dm_c1:
+            st.markdown("**Intraday trades only**")
+            count_i = len(load_trades(symbol, "INTRADAY"))
+            st.caption(f"{count_i} intraday trades for {symbol}")
+            if st.button(f"Clear {symbol} Intraday Trades", use_container_width=True):
+                clear_trades(symbol, "INTRADAY")
+                st.success(f"Cleared intraday trades for {symbol}"); st.rerun()
+
+        with dm_c2:
+            st.markdown("**CNC trades only**")
+            count_c = len(load_trades(symbol, "CNC"))
+            st.caption(f"{count_c} CNC trades for {symbol}")
+            if st.button(f"Clear {symbol} CNC Trades", use_container_width=True):
+                clear_trades(symbol, "CNC")
+                st.success(f"Cleared CNC trades for {symbol}"); st.rerun()
+
+        with dm_c3:
+            st.markdown("**All trades (all symbols)**")
+            count_all = stats["trades_intraday"] + stats["trades_cnc"]
+            st.caption(f"{count_all} total trades in DB")
+            if st.button("Clear ALL Trades (All Symbols)", use_container_width=True,
+                         type="secondary"):
+                clear_trades(); st.success("All trades cleared"); st.rerun()
+
+        st.markdown("---")
+
+        # ── Section 2: Clear Signals ──────────────────────────────────────
+        st.markdown("#### 🔻 Clear Cascade Signals")
+        dm_s1, dm_s2 = st.columns(2)
+
+        with dm_s1:
+            st.markdown(f"**Signals for {symbol}**")
+            con=sqlite3.connect(DB_PATH)
+            sc = pd.read_sql_query(
+                "SELECT COUNT(*) as c FROM cascade_signals WHERE symbol=?",
+                con,params=(symbol,)).iloc[0]["c"]; con.close()
+            st.caption(f"{int(sc)} signal rows for {symbol}")
+            if st.button(f"Clear {symbol} Signals", use_container_width=True):
+                clear_signals(symbol)
+                st.success(f"Cleared signals for {symbol}"); st.rerun()
+
+        with dm_s2:
+            st.markdown("**All signals (all symbols)**")
+            st.caption(f"{stats['signals']} total signal rows")
+            if st.button("Clear ALL Signals", use_container_width=True, type="secondary"):
+                clear_signals()
+                st.success("All signals cleared"); st.rerun()
+
+        st.markdown("---")
+
+        # ── Section 3: Clear Raw Chain ────────────────────────────────────
+        st.markdown("#### ☢️ Clear Raw Chain Data")
+        st.markdown(
+            '<div class="warn-box">Clearing raw chain also clears the fetch log. '
+            'You will need to re-fetch all data from Dhan API.</div>',
+            unsafe_allow_html=True)
+        dm_r1, dm_r2 = st.columns(2)
+
+        with dm_r1:
+            st.markdown(f"**Raw chain for {symbol}**")
+            con=sqlite3.connect(DB_PATH)
+            rc_cnt = pd.read_sql_query(
+                "SELECT COUNT(*) as c FROM raw_chain WHERE symbol=?",
+                con,params=(symbol,)).iloc[0]["c"]; con.close()
+            st.caption(f"{int(rc_cnt)} raw rows for {symbol}")
+            confirm_sym = st.text_input(
+                f'Type "{symbol}" to confirm', key="confirm_sym",
+                placeholder=symbol)
+            if st.button(f"Clear {symbol} Raw Chain", use_container_width=True,
+                         type="secondary", disabled=(confirm_sym != symbol)):
+                clear_raw_chain(symbol)
+                st.success(f"Cleared raw chain for {symbol}"); st.rerun()
+
+        with dm_r2:
+            st.markdown("**⚠️ FULL WIPE — All Data**")
+            st.caption(f"{stats['raw_rows']} raw rows · all symbols")
+            confirm_all = st.text_input(
+                'Type "WIPE ALL" to confirm', key="confirm_all",
+                placeholder="WIPE ALL")
+            if st.button("☢️ Full Database Wipe", use_container_width=True,
+                         type="secondary", disabled=(confirm_all != "WIPE ALL")):
+                clear_raw_chain()     # clears raw_chain + fetch_log
+                clear_signals()       # clears cascade_signals
+                clear_trades()        # clears bt_trades
+                clear_checkpoint()    # clears checkpoint file
+                st.success("✅ Full database wipe complete. Start fresh by fetching data.")
+                st.rerun()
+
+        st.markdown("---")
+
+        # ── DB Stats ──────────────────────────────────────────────────────
+        st.markdown("#### 📊 Current Database Stats")
+        fresh_stats = db_stats()
+        s1,s2,s3,s4,s5 = st.columns(5)
+        s1.metric("Raw Rows",       fresh_stats["raw_rows"])
+        s2.metric("Trading Days",   fresh_stats["days"])
+        s3.metric("Intraday Trades",fresh_stats["trades_intraday"])
+        s4.metric("CNC Trades",     fresh_stats["trades_cnc"])
+        s5.metric("Signal Rows",    fresh_stats["signals"])
+
+        # DB file size
+        if os.path.exists(DB_PATH):
+            size_mb = os.path.getsize(DB_PATH) / 1024 / 1024
+            st.caption(f"📁 {DB_PATH} — {size_mb:.2f} MB")
+
+    # ── Footer ────────────────────────────────────────────────────────────────
     st.markdown(
         '<div style="text-align:center;padding:16px;font-family:JetBrains Mono,monospace;'
         'font-size:0.68rem;color:rgba(255,255,255,0.2);">'
-        'HedGEX Cascade Backtest · NYZTrade Analytics · Research purposes only</div>',
-        unsafe_allow_html=True)
+        'HedGEX Cascade Backtest v3 · NYZTrade Analytics Pvt. Ltd. · Research purposes only'
+        '</div>', unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
