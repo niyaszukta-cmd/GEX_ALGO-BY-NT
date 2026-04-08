@@ -981,13 +981,16 @@ def main():
             clear_all_data()
             st.success("✅ All data wiped. Fresh start."); st.rerun()
 
-    tab_fetch, tab_signals, tab_bt, tab_results, tab_trades, tab_manage = st.tabs([
-        "1️⃣ Fetch Data",
-        "2️⃣ Compute Signals",
-        "3️⃣ Run Backtest",
-        "4️⃣ Results",
-        "5️⃣ Trade Log",
-        "6️⃣ Data Manager"])
+    (tab_fetch, tab_signals, tab_ibt, tab_cbt,
+     tab_ires, tab_cres, tab_trades, tab_manage) = st.tabs([
+        "📡 Fetch Data",
+        "⚡ Compute Signals",
+        "📈 Run Intraday BT",
+        "📦 Run CNC BT",
+        "📊 Intraday Results",
+        "📊 CNC Results",
+        "📋 Trade Log",
+        "🗄️ Data Management"])
 
     # ── Tab 1: Fetch ──────────────────────────────────────────────────────────
     with tab_fetch:
@@ -1127,145 +1130,137 @@ def main():
                     "cascade_target","cascade_stop"
                 ]], use_container_width=True, height=350, hide_index=True)
 
-    # ── Tab 3: Run Backtest ───────────────────────────────────────────────────
-    with tab_bt:
-        st.markdown("### 🔄 Run Backtest")
+    # ── Helper: get signal dates ───────────────────────────────────────────────
+    def _get_sig_dates():
         con = sqlite3.connect(DB_PATH)
-        all_sig = pd.read_sql_query(
+        df  = pd.read_sql_query(
             "SELECT DISTINCT trade_date FROM cascade_signals WHERE symbol=?",
             con, params=(symbol,))
         con.close()
-        all_sig_dates = sorted(all_sig["trade_date"].tolist()) if not all_sig.empty else []
+        return sorted(df["trade_date"].tolist()) if not df.empty else []
 
+    def _render_results(mode_label, bt_mode):
+        trades = load_trades(symbol, mode=bt_mode)
+        if trades.empty:
+            st.info(f"No {mode_label} trades yet — run the backtest first.")
+            return
+        m = compute_metrics(trades)
+
+        st.markdown("#### 📈 Core Metrics")
+        cols = st.columns(5)
+        for col,(label,val,cls) in zip(cols,[
+            ("Total Trades",  str(m["total_trades"]),         "n"),
+            ("Hit Rate",      f"{m['hit_rate']}%",            "g" if m["hit_rate"]>=50 else "r"),
+            ("Total P&L",     f"Rs.{m['total_pnl']:+,.0f}",  "g" if m["total_pnl"]>0  else "r"),
+            ("Profit Factor", f"{m['profit_factor']:.2f}x",  "g" if m["profit_factor"]>1 else "r"),
+            ("Max Drawdown",  f"Rs.{m['max_drawdown']:,.0f}", "r"),
+        ]):
+            col.markdown(f'<div class="metric-card"><div class="metric-val {cls}">{val}</div>'
+                         f'<div class="metric-lbl">{label}</div></div>', unsafe_allow_html=True)
+
+        st.markdown("#### ⚡ Risk & Performance")
+        cols2 = st.columns(5)
+        for col,(label,val,cls) in zip(cols2,[
+            ("Sharpe",    f"{m['sharpe']:.2f}",           "g" if m["sharpe"]>1  else "n"),
+            ("Sortino",   f"{m['sortino']:.2f}",          "g" if m["sortino"]>1 else "n"),
+            ("Avg Win",   f"Rs.{m['avg_win_pnl']:+,.0f}", "g"),
+            ("Avg Loss",  f"Rs.{m['avg_loss_pnl']:+,.0f}","r"),
+            ("Total Pts", f"{m['total_pts']:+.1f}",       "g" if m["total_pts"]>0 else "r"),
+        ]):
+            col.markdown(f'<div class="metric-card"><div class="metric-val {cls}">{val}</div>'
+                         f'<div class="metric-lbl">{label}</div></div>', unsafe_allow_html=True)
+
+        st.markdown("#### 🔍 Trade Breakdown")
+        cols3 = st.columns(5)
+        for col,(label,val,cls) in zip(cols3,[
+            ("CALL Trades",  f"{m['call_trades']} | Rs.{m['call_pnl']:+,.0f}", "g" if m["call_pnl"]>0 else "r"),
+            ("PUT Trades",   f"{m['put_trades']} | Rs.{m['put_pnl']:+,.0f}",   "g" if m["put_pnl"]>0 else "r"),
+            ("Target Hits",  str(m["target_hits"]), "g"),
+            ("Stop Hits",    str(m["stop_hits"]),   "r"),
+            ("EOD Exits",    str(m["eod_exits"]),   "n"),
+        ]):
+            col.markdown(f'<div class="metric-card"><div class="metric-val {cls}">{val}</div>'
+                         f'<div class="metric-lbl">{label}</div></div>', unsafe_allow_html=True)
+
+        st.markdown("---")
+        c1,c2 = st.columns([2,1])
+        with c1: st.plotly_chart(equity_curve_chart(trades), use_container_width=True)
+        with c2: st.plotly_chart(call_put_breakdown_chart(trades), use_container_width=True)
+        c3,c4 = st.columns(2)
+        with c3: st.plotly_chart(cascade_vs_pnl_chart(trades), use_container_width=True)
+        with c4: st.plotly_chart(exit_reason_chart(trades), use_container_width=True)
+        st.markdown("#### 📅 Monthly P&L")
+        st.plotly_chart(monthly_pnl_chart(trades), use_container_width=True)
+        st.download_button(f"📥 Download {mode_label} CSV",
+            data=trades.to_csv(index=False),
+            file_name=f"hedgex_{symbol}_{bt_mode}.csv",
+            mime="text/csv", use_container_width=True)
+
+    # ── Tab 3: Run Intraday BT ────────────────────────────────────────────────
+    with tab_ibt:
+        st.markdown("### 📈 Intraday Backtest")
+        st.markdown('<div class="info-box">Entry + Exit same day. EOD force-exit at last bar. '
+                    'Simulates day-trader options buying scenario.</div>', unsafe_allow_html=True)
+        all_sig_dates = _get_sig_dates()
         st.markdown(
             '<div class="info-box">'
             'Cascade trigger: <b>' + str(min_cascade) + ' pts</b> &nbsp;|&nbsp; '
-            'IV gate: <b>EXPANDING</b> &nbsp;|&nbsp; '
-            'SL: <b>50 pts</b> &nbsp;|&nbsp; '
+            'IV gate: <b>EXPANDING</b> &nbsp;|&nbsp; SL: <b>50 pts</b> &nbsp;|&nbsp; '
             'Target: <b>min(cumulative cascade, 200 pts)</b><br>'
             'Days with signals: <b>' + str(len(all_sig_dates)) + '</b>'
             '</div>', unsafe_allow_html=True)
+        if st.button("▶ Run INTRADAY Backtest", type="primary",
+                     use_container_width=True, disabled=(len(all_sig_dates)==0)):
+            clear_trades(symbol, mode="INTRADAY")
+            prog=st.progress(0); status=st.empty(); all_trades=[]
+            for idx,td in enumerate(all_sig_dates):
+                status.text(f"INTRADAY: {td} ({idx+1}/{len(all_sig_dates)})")
+                sig_df = load_signals(symbol, td)
+                if not sig_df.empty:
+                    all_trades.extend(run_backtest_for_day(
+                        sig_df, symbol, td, expiry_flag, min_cascade, backtest_mode="INTRADAY"))
+                prog.progress((idx+1)/len(all_sig_dates))
+            save_trades(all_trades, mode="INTRADAY")
+            prog.empty(); status.empty()
+            st.success(f"✅ INTRADAY done — {len(all_trades)} trades"); st.rerun()
 
-        bt_col1, bt_col2 = st.columns(2)
-        with bt_col1:
-            st.markdown("#### 📈 Intraday Backtest")
-            st.markdown('<div class="info-box">Intraday: Entry + Exit same day. EOD force-exit at last bar. Simulates day-trader scenario.</div>',
-                        unsafe_allow_html=True)
-            if st.button("▶ Run INTRADAY Backtest", type="primary",
-                         use_container_width=True, disabled=(len(all_sig_dates)==0)):
-                clear_trades(symbol, mode="INTRADAY")
-                prog=st.progress(0); status=st.empty(); all_trades=[]
-                for idx,td in enumerate(all_sig_dates):
-                    status.text(f"INTRADAY: {td} ({idx+1}/{len(all_sig_dates)})")
-                    sig_df = load_signals(symbol, td)
-                    if not sig_df.empty:
-                        all_trades.extend(run_backtest_for_day(
-                            sig_df, symbol, td, expiry_flag, min_cascade,
-                            backtest_mode="INTRADAY"))
-                    prog.progress((idx+1)/len(all_sig_dates))
-                save_trades(all_trades, mode="INTRADAY")
-                prog.empty(); status.empty()
-                st.success(f"✅ INTRADAY done — {len(all_trades)} trades"); st.rerun()
+    # ── Tab 4: Run CNC BT ─────────────────────────────────────────────────────
+    with tab_cbt:
+        st.markdown("### 📦 CNC / Swing Backtest")
+        st.markdown('<div class="info-box">Position held till target/stop hit. '
+                    'Simulates positional/swing options buying scenario.</div>', unsafe_allow_html=True)
+        all_sig_dates = _get_sig_dates()
+        st.markdown(
+            '<div class="info-box">'
+            'Cascade trigger: <b>' + str(min_cascade) + ' pts</b> &nbsp;|&nbsp; '
+            'IV gate: <b>EXPANDING</b> &nbsp;|&nbsp; SL: <b>50 pts</b> &nbsp;|&nbsp; '
+            'Target: <b>min(cumulative cascade, 200 pts)</b><br>'
+            'Days with signals: <b>' + str(len(all_sig_dates)) + '</b>'
+            '</div>', unsafe_allow_html=True)
+        if st.button("▶ Run CNC Backtest", type="primary",
+                     use_container_width=True, disabled=(len(all_sig_dates)==0)):
+            clear_trades(symbol, mode="CNC")
+            prog=st.progress(0); status=st.empty(); all_trades=[]
+            for idx,td in enumerate(all_sig_dates):
+                status.text(f"CNC: {td} ({idx+1}/{len(all_sig_dates)})")
+                sig_df = load_signals(symbol, td)
+                if not sig_df.empty:
+                    all_trades.extend(run_backtest_for_day(
+                        sig_df, symbol, td, expiry_flag, min_cascade, backtest_mode="CNC"))
+                prog.progress((idx+1)/len(all_sig_dates))
+            save_trades(all_trades, mode="CNC")
+            prog.empty(); status.empty()
+            st.success(f"✅ CNC done — {len(all_trades)} trades"); st.rerun()
 
-        with bt_col2:
-            st.markdown("#### 📦 CNC / Swing Backtest")
-            st.markdown('<div class="info-box">CNC: Position held till target/stop hit, can carry overnight. Simulates positional/swing scenario.</div>',
-                        unsafe_allow_html=True)
-            if st.button("▶ Run CNC Backtest", type="primary",
-                         use_container_width=True, disabled=(len(all_sig_dates)==0)):
-                clear_trades(symbol, mode="CNC")
-                prog=st.progress(0); status=st.empty(); all_trades=[]; open_trade=None
-                for idx,td in enumerate(all_sig_dates):
-                    status.text(f"CNC: {td} ({idx+1}/{len(all_sig_dates)})")
-                    sig_df = load_signals(symbol, td)
-                    if not sig_df.empty:
-                        # CNC: don't force EOD exit — carry over is handled by not closing at EOD
-                        # For simplicity: run like intraday but skip EOD force-exit
-                        day_trades = run_backtest_for_day(
-                            sig_df, symbol, td, expiry_flag, min_cascade,
-                            backtest_mode="CNC")
-                        # Filter out EOD exits (simulate holding overnight)
-                        all_trades.extend(day_trades)
-                    prog.progress((idx+1)/len(all_sig_dates))
-                save_trades(all_trades, mode="CNC")
-                prog.empty(); status.empty()
-                st.success(f"✅ CNC done — {len(all_trades)} trades"); st.rerun()
+    # ── Tab 5: Intraday Results ───────────────────────────────────────────────
+    with tab_ires:
+        st.markdown("### 📊 Intraday Results")
+        _render_results("Intraday", "INTRADAY")
 
-    # ── Tab 4: Results ────────────────────────────────────────────────────────
-    with tab_results:
-        st.markdown("### 📊 Results")
-
-        result_mode = st.radio("View Results For", ["INTRADAY","CNC","Both"], horizontal=True)
-        mode_filter = None if result_mode == "Both" else result_mode
-        trades = load_trades(symbol, mode=mode_filter)
-
-        if trades.empty:
-            st.info("No trades yet — run backtest in Tab 3 first.")
-        else:
-            m = compute_metrics(trades)
-
-            # Row 1: Core metrics
-            st.markdown("#### 📈 Core Metrics")
-            cols = st.columns(5)
-            kpis = [
-                ("Total Trades",    str(m["total_trades"]),              "n"),
-                ("Hit Rate",        f"{m['hit_rate']}%",                 "g" if m["hit_rate"]>=50 else "r"),
-                ("Total P&L",       f"₹{m['total_pnl']:+,.0f}",          "g" if m["total_pnl"]>0  else "r"),
-                ("Profit Factor",   f"{m['profit_factor']:.2f}x",        "g" if m["profit_factor"]>1 else "r"),
-                ("Max Drawdown",    f"₹{m['max_drawdown']:,.0f}",         "r"),
-            ]
-            for col,(label,val,cls) in zip(cols,kpis):
-                col.markdown(
-                    f'<div class="metric-card"><div class="metric-val {cls}">{val}</div>'
-                    f'<div class="metric-lbl">{label}</div></div>', unsafe_allow_html=True)
-
-            # Row 2: Risk metrics
-            st.markdown("#### ⚡ Risk & Performance")
-            cols2 = st.columns(5)
-            kpis2 = [
-                ("Sharpe",          f"{m['sharpe']:.2f}",               "g" if m["sharpe"]>1  else "n"),
-                ("Sortino",         f"{m['sortino']:.2f}",              "g" if m["sortino"]>1 else "n"),
-                ("Avg Win",         f"₹{m['avg_win_pnl']:+,.0f}",        "g"),
-                ("Avg Loss",        f"₹{m['avg_loss_pnl']:+,.0f}",       "r"),
-                ("Total Pts",       f"{m['total_pts']:+.1f}",            "g" if m["total_pts"]>0 else "r"),
-            ]
-            for col,(label,val,cls) in zip(cols2,kpis2):
-                col.markdown(
-                    f'<div class="metric-card"><div class="metric-val {cls}">{val}</div>'
-                    f'<div class="metric-lbl">{label}</div></div>', unsafe_allow_html=True)
-
-            # Row 3: Breakdown
-            st.markdown("#### 🔍 Trade Breakdown")
-            cols3 = st.columns(5)
-            kpis3 = [
-                ("CALL Trades",     f"{m['call_trades']} | ₹{m['call_pnl']:+,.0f}", "g" if m["call_pnl"]>0 else "r"),
-                ("PUT Trades",      f"{m['put_trades']} | ₹{m['put_pnl']:+,.0f}",   "g" if m["put_pnl"]>0 else "r"),
-                ("Target Hits",     str(m["target_hits"]),               "g"),
-                ("Stop Hits",       str(m["stop_hits"]),                 "r"),
-                ("EOD Exits",       str(m["eod_exits"]),                 "n"),
-            ]
-            for col,(label,val,cls) in zip(cols3,kpis3):
-                col.markdown(
-                    f'<div class="metric-card"><div class="metric-val {cls}">{val}</div>'
-                    f'<div class="metric-lbl">{label}</div></div>', unsafe_allow_html=True)
-
-            st.markdown("---")
-
-            c1,c2 = st.columns([2,1])
-            with c1: st.plotly_chart(equity_curve_chart(trades), use_container_width=True)
-            with c2: st.plotly_chart(call_put_breakdown_chart(trades), use_container_width=True)
-
-            c3,c4 = st.columns(2)
-            with c3: st.plotly_chart(cascade_vs_pnl_chart(trades), use_container_width=True)
-            with c4: st.plotly_chart(exit_reason_chart(trades), use_container_width=True)
-
-            st.markdown("#### 📅 Monthly P&L")
-            st.plotly_chart(monthly_pnl_chart(trades), use_container_width=True)
-
-            st.download_button("📥 Download CSV",
-                data=trades.to_csv(index=False),
-                file_name=f"hedgex_{symbol}_{result_mode}.csv",
-                mime="text/csv", use_container_width=True)
+    # ── Tab 6: CNC Results ────────────────────────────────────────────────────
+    with tab_cres:
+        st.markdown("### 📊 CNC Results")
+        _render_results("CNC", "CNC")
 
     # ── Tab 5: Trade Log ──────────────────────────────────────────────────────
     with tab_trades:
@@ -1291,6 +1286,9 @@ def main():
             disp["exit_time"]  = pd.to_datetime(disp["exit_time"]).dt.strftime("%H:%M")
             disp["is_expiry_day"] = disp["is_expiry_day"].map({0:"","1":"Expiry",1:"Expiry"})
 
+            # Build color mask BEFORE renaming (avoids pandas Styler KeyError on special chars)
+            pnl_values = disp["pnl_per_lot"].values
+
             disp = disp.rename(columns={
                 "trade_date": "Date",
                 "backtest_mode": "Mode",
@@ -1304,7 +1302,7 @@ def main():
                 "option_buy_price": "Buy Px",
                 "option_sell_price": "Sell Px",
                 "pts_captured": "Spot Pts",
-                "pnl_per_lot": "P&L/Lot (₹)",
+                "pnl_per_lot": "PnL per Lot",
                 "contract_size": "Lot Size",
                 "cascade_trigger_pts": "Cascade Pts",
                 "cascade_target": "Target",
@@ -1315,13 +1313,18 @@ def main():
             })
 
             def row_color(row):
-                if row["P&L/Lot (₹)"] > 0:
-                    return ["background-color:rgba(16,185,129,0.12)"]*len(row)
-                return ["background-color:rgba(239,68,68,0.10)"]*len(row)
+                idx = row.name
+                val = pnl_values[idx] if idx < len(pnl_values) else 0
+                if val > 0:
+                    return ["background-color:rgba(16,185,129,0.12)"] * len(row)
+                return ["background-color:rgba(239,68,68,0.10)"] * len(row)
 
-            st.dataframe(
-                disp.style.apply(row_color, axis=1),
-                use_container_width=True, height=600, hide_index=True)
+            try:
+                styled = disp.reset_index(drop=True).style.apply(row_color, axis=1)
+                st.dataframe(styled, use_container_width=True, height=600, hide_index=True)
+            except Exception:
+                # Fallback: plain dataframe without styling
+                st.dataframe(disp, use_container_width=True, height=600, hide_index=True)
 
             # Summary table by option type
             st.markdown("#### 📊 Summary by Option Type")
