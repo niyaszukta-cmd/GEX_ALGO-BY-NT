@@ -471,9 +471,69 @@ def fetch_rolling_option(symbol: str, from_date: str, to_date: str,
         st.warning(f"API error {symbol} {strike_type} {option_type}: {e}")
     return None
 
+# ============================================================================
+# CHECKPOINT — mid-session resume at strike level
+# ============================================================================
+CKPT_PATH = "hedgex_checkpoint.json"
+
+def save_checkpoint(symbol: str, trade_date: str, expiry_code: int,
+                    expiry_flag: str, completed_strikes: List[str],
+                    partial_rows: List[Dict]) -> None:
+    """Persist progress so a crashed session can resume."""
+    ckpt = {
+        "symbol":            symbol,
+        "trade_date":        trade_date,
+        "expiry_code":       expiry_code,
+        "expiry_flag":       expiry_flag,
+        "completed_strikes": completed_strikes,
+        "partial_rows":      partial_rows,
+        "saved_at":          datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    with open(CKPT_PATH, "w") as f:
+        json.dump(ckpt, f)
+
+def load_checkpoint(symbol: str, trade_date: str,
+                    expiry_code: int, expiry_flag: str) -> Tuple[List[str], List[Dict]]:
+    """
+    Returns (completed_strikes, partial_rows) if a matching checkpoint exists,
+    else ([], []).
+    """
+    if not os.path.exists(CKPT_PATH):
+        return [], []
+    try:
+        with open(CKPT_PATH) as f:
+            ckpt = json.load(f)
+        if (ckpt["symbol"]      == symbol
+                and ckpt["trade_date"]   == trade_date
+                and ckpt["expiry_code"]  == expiry_code
+                and ckpt["expiry_flag"]  == expiry_flag):
+            return ckpt["completed_strikes"], ckpt["partial_rows"]
+    except Exception:
+        pass
+    return [], []
+
+def clear_checkpoint() -> None:
+    if os.path.exists(CKPT_PATH):
+        os.remove(CKPT_PATH)
+
+def checkpoint_status() -> Optional[Dict]:
+    if not os.path.exists(CKPT_PATH):
+        return None
+    try:
+        with open(CKPT_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
 def fetch_one_day(symbol: str, trade_date: str, strikes: List[str],
                   interval: str, expiry_code: int, expiry_flag: str,
                   progress_bar=None, status_text=None) -> int:
+    """
+    Fetch one trading day — CALL + PUT per strike, process rows, save to DB.
+    Uses local dict (no function attributes) — thread-safe.
+    Checkpoints after every strike so crashes can resume mid-day.
+    """
     cfg           = INDEX_CONFIG.get(symbol, {})
     contract_size = cfg.get("contract_size", 25)
     scaling       = 1e9
@@ -482,87 +542,110 @@ def fetch_one_day(symbol: str, trade_date: str, strikes: List[str],
     from_date     = (target_dt - timedelta(days=1)).strftime("%Y-%m-%d")
     to_date       = (target_dt + timedelta(days=1)).strftime("%Y-%m-%d")
 
-    all_rows  = []
-    total     = len(strikes) * 2
-    done      = 0
+    # ── Resume from checkpoint if available ──────────────────────────────────
+    completed_strikes, all_rows = load_checkpoint(
+        symbol, trade_date, expiry_code, expiry_flag)
+    remaining_strikes = [s for s in strikes if s not in completed_strikes]
 
-    for stype in strikes:
+    total = len(strikes) * 2
+    done  = len(completed_strikes) * 2   # already done
+
+    # ── Per-strike: fetch CALL + PUT, pair immediately, process rows ─────────
+    for stype in remaining_strikes:
+        # Use plain local dict — no function attribute, fully thread-safe
+        strike_data: Dict[str, Dict] = {}
+
         for otype in ["CALL", "PUT"]:
             if status_text:
-                status_text.text(f"Fetching {symbol} {stype} {otype} | {trade_date}")
-            data = fetch_rolling_option(symbol, from_date, to_date,
-                                        stype, otype, interval, expiry_code, expiry_flag)
+                status_text.text(
+                    f"Fetching {symbol} {stype} {otype} | {trade_date} "
+                    f"({len(completed_strikes)+1}/{len(strikes)})"
+                )
+            data = fetch_rolling_option(
+                symbol, from_date, to_date,
+                stype, otype, interval, expiry_code, expiry_flag,
+            )
             done += 1
             if progress_bar:
-                progress_bar.progress(done / total)
+                progress_bar.progress(min(done / total, 1.0))
             time.sleep(0.3)
 
-            if not data:
-                continue
+            if data:
+                strike_data[otype] = data
 
-            # pair call+put in second pass — store raw for now per option type
-            key = (stype, otype)
-            if not hasattr(fetch_one_day, '_tmp'):
-                fetch_one_day._tmp = {}
-            fetch_one_day._tmp[key] = data
+        # ── Pair CALL + PUT for this strike ───────────────────────────────────
+        ce = strike_data.get("CALL", {})
+        pe = strike_data.get("PUT",  {})
 
-    # Now pair CALL + PUT per strike
-    for stype in strikes:
-        ce = fetch_one_day._tmp.get((stype, "CALL"), {})
-        pe = fetch_one_day._tmp.get((stype, "PUT"),  {})
-        if not ce: continue
-        ts_list = ce.get("timestamp", [])
-        for i, ts in enumerate(ts_list):
-            try:
-                dt_ist = datetime.fromtimestamp(ts, tz=pytz.UTC).astimezone(IST)
-                if dt_ist.date() != target_dt: continue
-                spot   = ce.get("spot",   [0]*len(ts_list))[i] or 0
-                strike = ce.get("strike", [0]*len(ts_list))[i] or 0
-                if spot == 0 or strike == 0: continue
-                c_oi  = ce.get("oi",     [0]*len(ts_list))[i] or 0
-                p_oi  = pe.get("oi",     [0]*len(ts_list))[i] if pe else 0
-                c_vol = ce.get("volume", [0]*len(ts_list))[i] or 0
-                p_vol = pe.get("volume", [0]*len(ts_list))[i] if pe else 0
-                c_iv  = ce.get("iv",     [15]*len(ts_list))[i] or 15
-                p_iv  = pe.get("iv",     [15]*len(ts_list))[i] if pe else 15
-                civ   = c_iv / 100 if c_iv > 1 else c_iv
-                piv   = p_iv / 100 if p_iv > 1 else p_iv
-                cg    = BS.gamma(spot, strike, tte, RISK_FREE, civ)
-                pg    = BS.gamma(spot, strike, tte, RISK_FREE, piv)
-                cv    = BS.vanna(spot, strike, tte, RISK_FREE, civ)
-                pv    = BS.vanna(spot, strike, tte, RISK_FREE, piv)
-                all_rows.append({
-                    "symbol":      symbol,
-                    "trade_date":  trade_date,
-                    "timestamp":   dt_ist.strftime("%Y-%m-%d %H:%M:%S"),
-                    "strike_type": stype,
-                    "strike":      float(strike),
-                    "spot_price":  float(spot),
-                    "call_oi":     float(c_oi),
-                    "put_oi":      float(p_oi),
-                    "call_vol":    float(c_vol),
-                    "put_vol":     float(p_vol),
-                    "call_iv":     float(c_iv),
-                    "put_iv":      float(p_iv),
-                    "call_gex":    float((c_oi * cg * spot**2 * contract_size) / scaling),
-                    "put_gex":     float(-(p_oi * pg * spot**2 * contract_size) / scaling),
-                    "net_gex":     float((c_oi * cg - p_oi * pg) * spot**2 * contract_size / scaling),
-                    "call_vanna":  float(c_oi * cv * spot * contract_size / scaling),
-                    "put_vanna":   float(p_oi * pv * spot * contract_size / scaling),
-                    "net_vanna":   float((c_oi * cv + p_oi * pv) * spot * contract_size / scaling),
-                    "call_oi_chg": 0.0,
-                    "put_oi_chg":  0.0,
-                    "interval":    interval,
-                    "expiry_code": expiry_code,
-                    "expiry_flag": expiry_flag,
-                })
-            except Exception:
-                continue
+        if ce:
+            ts_list = ce.get("timestamp", [])
+            n_ts    = len(ts_list)
+            for i, ts in enumerate(ts_list):
+                try:
+                    dt_ist = datetime.fromtimestamp(ts, tz=pytz.UTC).astimezone(IST)
+                    if dt_ist.date() != target_dt:
+                        continue
 
-    # Clean up temp
-    fetch_one_day._tmp = {}
+                    def _safe(src, key, default, idx):
+                        arr = src.get(key, [])
+                        return arr[idx] if idx < len(arr) else default
 
-    # Compute OI change per strike across timestamps
+                    spot   = _safe(ce, "spot",   0,  i) or 0
+                    strike = _safe(ce, "strike", 0,  i) or 0
+                    if spot == 0 or strike == 0:
+                        continue
+
+                    c_oi  = _safe(ce, "oi",     0,  i) or 0
+                    p_oi  = _safe(pe, "oi",     0,  i) or 0  if pe else 0
+                    c_vol = _safe(ce, "volume", 0,  i) or 0
+                    p_vol = _safe(pe, "volume", 0,  i) or 0  if pe else 0
+                    c_iv  = _safe(ce, "iv",    15,  i) or 15
+                    p_iv  = _safe(pe, "iv",    15,  i) or 15 if pe else 15
+
+                    civ = c_iv / 100 if c_iv > 1 else float(c_iv)
+                    piv = p_iv / 100 if p_iv > 1 else float(p_iv)
+                    civ = max(civ, 0.01)
+                    piv = max(piv, 0.01)
+
+                    cg = BS.gamma(spot, strike, tte, RISK_FREE, civ)
+                    pg = BS.gamma(spot, strike, tte, RISK_FREE, piv)
+                    cv = BS.vanna(spot, strike, tte, RISK_FREE, civ)
+                    pv = BS.vanna(spot, strike, tte, RISK_FREE, piv)
+
+                    all_rows.append({
+                        "symbol":      symbol,
+                        "trade_date":  trade_date,
+                        "timestamp":   dt_ist.strftime("%Y-%m-%d %H:%M:%S"),
+                        "strike_type": stype,
+                        "strike":      float(strike),
+                        "spot_price":  float(spot),
+                        "call_oi":     float(c_oi),
+                        "put_oi":      float(p_oi),
+                        "call_vol":    float(c_vol),
+                        "put_vol":     float(p_vol),
+                        "call_iv":     float(c_iv),
+                        "put_iv":      float(p_iv),
+                        "call_gex":    float((c_oi * cg * spot**2 * contract_size) / scaling),
+                        "put_gex":     float(-(p_oi * pg * spot**2 * contract_size) / scaling),
+                        "net_gex":     float((c_oi * cg - p_oi * pg) * spot**2 * contract_size / scaling),
+                        "call_vanna":  float(c_oi * cv * spot * contract_size / scaling),
+                        "put_vanna":   float(p_oi * pv * spot * contract_size / scaling),
+                        "net_vanna":   float((c_oi * cv + p_oi * pv) * spot * contract_size / scaling),
+                        "call_oi_chg": 0.0,
+                        "put_oi_chg":  0.0,
+                        "interval":    interval,
+                        "expiry_code": expiry_code,
+                        "expiry_flag": expiry_flag,
+                    })
+                except Exception:
+                    continue
+
+        # ── Mark this strike done, checkpoint ─────────────────────────────────
+        completed_strikes.append(stype)
+        save_checkpoint(symbol, trade_date, expiry_code, expiry_flag,
+                        completed_strikes, all_rows)
+
+    # ── Compute OI change per strike across timestamps ────────────────────────
     if all_rows:
         df = pd.DataFrame(all_rows).sort_values(["strike", "timestamp"])
         for st_val in df["strike"].unique():
@@ -572,6 +655,7 @@ def fetch_one_day(symbol: str, trade_date: str, strikes: List[str],
         all_rows = df.to_dict("records")
 
     save_raw_chain(all_rows)
+    clear_checkpoint()        # day complete — remove checkpoint
     return len(all_rows)
 
 # ============================================================================
@@ -1125,9 +1209,33 @@ def main():
         For each trading day in your date range, the engine calls<br>
         <code>POST /charts/rollingoption</code> for each strike (CALL + PUT).<br>
         Data is stored in SQLite — each day is fetched only once.<br>
-        Already-fetched days are skipped automatically.
+        Already-fetched days are skipped automatically.<br>
+        <b>Checkpoint:</b> Progress is saved after every strike — if the session
+        crashes or times out, the next fetch run resumes from where it stopped.
         </div>
         """, unsafe_allow_html=True)
+
+        # ── Checkpoint banner ─────────────────────────────────────────────────
+        ckpt = checkpoint_status()
+        if ckpt:
+            ckpt_done = len(ckpt.get("completed_strikes", []))
+            ckpt_rows = len(ckpt.get("partial_rows", []))
+            st.markdown(f"""
+            <div class="warn-box">
+            <b>⚡ Checkpoint detected — incomplete session found!</b><br>
+            Symbol: <b>{ckpt.get("symbol")}</b> &nbsp;|&nbsp;
+            Date: <b>{ckpt.get("trade_date")}</b> &nbsp;|&nbsp;
+            Strikes done: <b>{ckpt_done}</b> &nbsp;|&nbsp;
+            Rows saved: <b>{ckpt_rows:,}</b><br>
+            Saved at: {ckpt.get("saved_at","?")}
+            <br><br>The next fetch run will <b>automatically resume</b> from the saved strike.
+            </div>
+            """, unsafe_allow_html=True)
+            if st.button("🗑️ Discard Checkpoint (start fresh for that day)",
+                         key="discard_ckpt"):
+                clear_checkpoint()
+                st.success("Checkpoint cleared.")
+                st.rerun()
 
         trading_dates = get_trading_dates(d_start, d_end)
         done_dates    = get_fetch_log(symbol, expiry_code, expiry_flag)
@@ -1162,6 +1270,11 @@ def main():
 
             for idx, trade_date in enumerate(pending):
                 day_status.text(f"Day {idx+1}/{len(pending)}: {trade_date}")
+                # Check if checkpoint exists for this specific day
+                ckpt_now = checkpoint_status()
+                if ckpt_now and ckpt_now.get("trade_date") != trade_date:
+                    # Stale checkpoint from a different date — clear it
+                    clear_checkpoint()
                 try:
                     n = fetch_one_day(
                         symbol, trade_date, all_strikes,
@@ -1172,8 +1285,13 @@ def main():
                     log_fetch(symbol, trade_date, expiry_code, expiry_flag, "ok", n)
                     log_lines.append(f"✅ {trade_date} — {n:,} rows")
                 except Exception as e:
-                    log_fetch(symbol, trade_date, expiry_code, expiry_flag, "error", 0)
-                    log_lines.append(f"❌ {trade_date} — {e}")
+                    # Save what we have — checkpoint already written inside fetch_one_day
+                    # Mark as partial so it shows in pending next run
+                    log_lines.append(f"⚠️ {trade_date} — interrupted: {e} (checkpoint saved)")
+                    log_container.text("\n".join(log_lines[-15:]))
+                    st.warning(f"Session interrupted at {trade_date}. "
+                               f"Checkpoint saved — restart fetch to resume.")
+                    break   # stop loop, don't mark as ok
 
                 overall_bar.progress((idx + 1) / len(pending))
                 log_container.text("\n".join(log_lines[-15:]))
