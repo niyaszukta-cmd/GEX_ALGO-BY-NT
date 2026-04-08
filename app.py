@@ -458,6 +458,63 @@ def db_stats() -> Dict:
 
 
 # ============================================================================
+# CHECKPOINT — mid-session resume at strike level
+# ============================================================================
+CKPT_PATH = "hedgex_checkpoint.json"
+
+def save_checkpoint(symbol: str, trade_date: str, expiry_code: int,
+                    expiry_flag: str, completed_strikes: List[str],
+                    partial_rows: List[Dict]) -> None:
+    """Persist progress after every strike so crashes can resume."""
+    try:
+        with open(CKPT_PATH, "w") as f:
+            json.dump({
+                "symbol":            symbol,
+                "trade_date":        trade_date,
+                "expiry_code":       expiry_code,
+                "expiry_flag":       expiry_flag,
+                "completed_strikes": completed_strikes,
+                "partial_rows":      partial_rows,
+                "saved_at":          datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
+            }, f)
+    except Exception:
+        pass
+
+def load_checkpoint(symbol: str, trade_date: str,
+                    expiry_code: int, expiry_flag: str) -> Tuple[List[str], List[Dict]]:
+    """Returns (completed_strikes, partial_rows) if matching checkpoint exists."""
+    if not os.path.exists(CKPT_PATH):
+        return [], []
+    try:
+        with open(CKPT_PATH) as f:
+            ckpt = json.load(f)
+        if (ckpt.get("symbol")      == symbol
+                and ckpt.get("trade_date")   == trade_date
+                and ckpt.get("expiry_code")  == expiry_code
+                and ckpt.get("expiry_flag")  == expiry_flag):
+            return ckpt.get("completed_strikes", []), ckpt.get("partial_rows", [])
+    except Exception:
+        pass
+    return [], []
+
+def clear_checkpoint() -> None:
+    try:
+        if os.path.exists(CKPT_PATH):
+            os.remove(CKPT_PATH)
+    except Exception:
+        pass
+
+def checkpoint_status() -> Optional[Dict]:
+    if not os.path.exists(CKPT_PATH):
+        return None
+    try:
+        with open(CKPT_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+# ============================================================================
 # DHAN API — DATA FETCHER  (mirrors working dashboard exactly)
 # ============================================================================
 
