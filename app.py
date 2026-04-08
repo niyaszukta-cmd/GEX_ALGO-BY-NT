@@ -120,7 +120,9 @@ def get_headers() -> Dict:
 
 # ── Database ──────────────────────────────────────────────────────────────────
 def init_db():
-    con = sqlite3.connect(DB_PATH); cur = con.cursor()
+    con = sqlite3.connect(DB_PATH, timeout=20); cur = con.cursor()
+    cur.execute("PRAGMA journal_mode=WAL")   # allow concurrent reads during writes
+    cur.execute("PRAGMA synchronous=NORMAL")
 
     cur.execute("""CREATE TABLE IF NOT EXISTS raw_chain(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -163,8 +165,9 @@ def init_db():
     try: cur.execute("ALTER TABLE bt_trades ADD COLUMN pnl_per_lot REAL DEFAULT 0.0")
     except: pass
     # Back-fill pnl_per_lot for rows migrated from v2 (NULL or corrupted text value)
+    # Use typeof() instead of GLOB to avoid Python sqlite3 driver misparse
     cur.execute("UPDATE bt_trades SET pnl_per_lot=0.0 WHERE pnl_per_lot IS NULL")
-    cur.execute("UPDATE bt_trades SET pnl_per_lot=0.0 WHERE CAST(pnl_per_lot AS TEXT) NOT GLOB "*[0-9]*"")
+    cur.execute("UPDATE bt_trades SET pnl_per_lot=0.0 WHERE typeof(pnl_per_lot)='text'")
     cur.execute("UPDATE bt_trades SET bt_mode='INTRADAY' WHERE bt_mode IS NULL")
 
     cur.execute("""CREATE TABLE IF NOT EXISTS fetch_log(
@@ -175,13 +178,13 @@ def init_db():
     con.commit(); con.close()
 
 def get_fetch_log(symbol, expiry_code, expiry_flag):
-    con = sqlite3.connect(DB_PATH); cur = con.cursor()
+    con = sqlite3.connect(DB_PATH, timeout=20); cur = con.cursor()
     cur.execute("SELECT trade_date FROM fetch_log WHERE symbol=? AND expiry_code=? AND expiry_flag=? AND status='ok'",
                 (symbol, expiry_code, expiry_flag))
     done = {r[0] for r in cur.fetchall()}; con.close(); return done
 
 def log_fetch(symbol, trade_date, expiry_code, expiry_flag, status, rows):
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=20)
     con.execute("INSERT OR REPLACE INTO fetch_log VALUES(?,?,?,?,?,?,?)",
                 (symbol,trade_date,expiry_code,expiry_flag,status,rows,
                  datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")))
@@ -189,7 +192,7 @@ def log_fetch(symbol, trade_date, expiry_code, expiry_flag, status, rows):
 
 def save_raw_chain(rows):
     if not rows: return
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=20)
     con.executemany("""INSERT OR IGNORE INTO raw_chain
         (symbol,trade_date,timestamp,strike_type,strike,spot_price,
          call_oi,put_oi,call_vol,put_vol,call_iv,put_iv,
@@ -202,7 +205,7 @@ def save_raw_chain(rows):
     con.commit(); con.close()
 
 def load_raw_chain(symbol, date_str, expiry_code, expiry_flag):
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=20)
     df = pd.read_sql_query(
         "SELECT * FROM raw_chain WHERE symbol=? AND trade_date=? AND expiry_code=? AND expiry_flag=? ORDER BY timestamp,strike",
         con, params=(symbol,date_str,expiry_code,expiry_flag)); con.close()
@@ -211,7 +214,7 @@ def load_raw_chain(symbol, date_str, expiry_code, expiry_flag):
 
 def save_signals(rows):
     if not rows: return
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=20)
     con.executemany("""INSERT OR REPLACE INTO cascade_signals
         (symbol,trade_date,timestamp,spot_price,bear_fuel_pts,bear_absorb_pts,
          bull_fuel_pts,bull_absorb_pts,bear_quality,bull_quality,
@@ -224,7 +227,7 @@ def save_signals(rows):
     con.commit(); con.close()
 
 def load_signals(symbol, date_str):
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=20)
     df = pd.read_sql_query(
         "SELECT * FROM cascade_signals WHERE symbol=? AND trade_date=? ORDER BY timestamp",
         con, params=(symbol,date_str)); con.close()
@@ -233,7 +236,7 @@ def load_signals(symbol, date_str):
 
 def save_trades(rows):
     if not rows: return
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=20)
     con.executemany("""INSERT INTO bt_trades
         (symbol,trade_date,entry_time,exit_time,direction,entry_price,exit_price,
          pts_captured,pnl_per_lot,cascade_target,cascade_stop,exit_reason,
@@ -244,7 +247,7 @@ def save_trades(rows):
     con.commit(); con.close()
 
 def load_trades(symbol=None, bt_mode=None):
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=20)
     conditions = []
     params = []
     if symbol:
@@ -257,7 +260,7 @@ def load_trades(symbol=None, bt_mode=None):
     return df
 
 def clear_trades(symbol=None, bt_mode=None):
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=20)
     conditions = []
     params = []
     if symbol:
@@ -269,7 +272,7 @@ def clear_trades(symbol=None, bt_mode=None):
     con.commit(); con.close()
 
 def clear_signals(symbol=None):
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=20)
     if symbol:
         con.execute("DELETE FROM cascade_signals WHERE symbol=?", (symbol,))
     else:
@@ -277,7 +280,7 @@ def clear_signals(symbol=None):
     con.commit(); con.close()
 
 def clear_raw_chain(symbol=None):
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=20)
     if symbol:
         con.execute("DELETE FROM raw_chain WHERE symbol=?", (symbol,))
         con.execute("DELETE FROM fetch_log WHERE symbol=?", (symbol,))
@@ -287,7 +290,7 @@ def clear_raw_chain(symbol=None):
     con.commit(); con.close()
 
 def db_stats():
-    con = sqlite3.connect(DB_PATH); cur = con.cursor()
+    con = sqlite3.connect(DB_PATH, timeout=20); cur = con.cursor()
     cur.execute("SELECT COUNT(*) FROM raw_chain");         rr = cur.fetchone()[0]
     cur.execute("SELECT COUNT(DISTINCT trade_date),COUNT(DISTINCT symbol) FROM raw_chain")
     days, syms = cur.fetchone()
@@ -1337,7 +1340,7 @@ def main():
 
         with st.expander("🔎 Verify Strike Labels in DB"):
             if st.button("Check strike_type values", key="stcheck"):
-                con = sqlite3.connect(DB_PATH)
+                con = sqlite3.connect(DB_PATH, timeout=20)
                 df_st = pd.read_sql_query(
                     "SELECT DISTINCT strike_type FROM raw_chain WHERE symbol=? LIMIT 30",
                     con, params=(symbol,)); con.close()
@@ -1352,7 +1355,7 @@ def main():
 
         if done_dates:
             st.markdown("#### ✅ Fetched Days")
-            con=sqlite3.connect(DB_PATH)
+            con=sqlite3.connect(DB_PATH, timeout=20)
             st.dataframe(pd.read_sql_query(
                 "SELECT trade_date,rows_fetched,fetched_at FROM fetch_log "
                 "WHERE symbol=? AND expiry_code=? AND expiry_flag=? AND status='ok' "
@@ -1370,7 +1373,7 @@ def main():
             'Compute signals here for the legacy cascade dashboard.</div>',
             unsafe_allow_html=True)
         done_dates_s = get_fetch_log(symbol, expiry_code, expiry_flag)
-        con=sqlite3.connect(DB_PATH)
+        con=sqlite3.connect(DB_PATH, timeout=20)
         sig_d=pd.read_sql_query("SELECT DISTINCT trade_date FROM cascade_signals WHERE symbol=?",
                                 con,params=(symbol,)); con.close()
         sig_dates   = set(sig_d["trade_date"].tolist()) if not sig_d.empty else set()
@@ -1557,7 +1560,7 @@ def main():
 
         with dm_s1:
             st.markdown(f"**Signals for {symbol}**")
-            con=sqlite3.connect(DB_PATH)
+            con=sqlite3.connect(DB_PATH, timeout=20)
             sc = pd.read_sql_query(
                 "SELECT COUNT(*) as c FROM cascade_signals WHERE symbol=?",
                 con,params=(symbol,)).iloc[0]["c"]; con.close()
@@ -1585,7 +1588,7 @@ def main():
 
         with dm_r1:
             st.markdown(f"**Raw chain for {symbol}**")
-            con=sqlite3.connect(DB_PATH)
+            con=sqlite3.connect(DB_PATH, timeout=20)
             rc_cnt = pd.read_sql_query(
                 "SELECT COUNT(*) as c FROM raw_chain WHERE symbol=?",
                 con,params=(symbol,)).iloc[0]["c"]; con.close()
