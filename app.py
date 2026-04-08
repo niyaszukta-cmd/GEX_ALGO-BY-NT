@@ -539,8 +539,11 @@ def fetch_one_day(symbol: str, trade_date: str, strikes: List[str],
     scaling       = 1e9
     tte           = 7/365 if expiry_flag == "WEEK" else 30/365
     target_dt     = datetime.strptime(trade_date, "%Y-%m-%d").date()
-    from_date     = (target_dt - timedelta(days=1)).strftime("%Y-%m-%d")
-    to_date       = (target_dt + timedelta(days=1)).strftime("%Y-%m-%d")
+    # Dhan rollingoption: use exact day for both fromDate and toDate.
+    # A ±1 day buffer causes the API to return adjacent-expiry data
+    # which then fails the date filter and produces 0 rows.
+    from_date     = trade_date
+    to_date       = trade_date
 
     # ── Resume from checkpoint if available ──────────────────────────────────
     completed_strikes, all_rows = load_checkpoint(
@@ -582,9 +585,16 @@ def fetch_one_day(symbol: str, trade_date: str, strikes: List[str],
             n_ts    = len(ts_list)
             for i, ts in enumerate(ts_list):
                 try:
+                    # Try UTC interpretation first
                     dt_ist = datetime.fromtimestamp(ts, tz=pytz.UTC).astimezone(IST)
+                    # Dhan sometimes returns epoch already in IST (no TZ offset).
+                    # If the UTC interpretation gives wrong date, treat as IST-local.
                     if dt_ist.date() != target_dt:
-                        continue
+                        dt_ist_local = datetime.fromtimestamp(ts).replace(tzinfo=IST)
+                        if dt_ist_local.date() == target_dt:
+                            dt_ist = dt_ist_local
+                        else:
+                            continue  # genuinely wrong date — skip
 
                     def _safe(src, key, default, idx):
                         arr = src.get(key, [])
@@ -654,6 +664,11 @@ def fetch_one_day(symbol: str, trade_date: str, strikes: List[str],
             df.loc[mask, "put_oi_chg"]  = df.loc[mask, "put_oi"].diff().fillna(0)
         all_rows = df.to_dict("records")
 
+    if not all_rows and status_text:
+        status_text.text(
+            f"⚠️ {trade_date}: API responded but 0 rows matched target date. "
+            f"Check token validity and expiry_code."
+        )
     save_raw_chain(all_rows)
     clear_checkpoint()        # day complete — remove checkpoint
     return len(all_rows)
@@ -1300,6 +1315,61 @@ def main():
             status_txt.empty(); day_status.empty()
             st.success(f"✅ Fetch complete — {len(pending)} days processed.")
             st.rerun()
+
+        # ── API Response Inspector ────────────────────────────────────────────
+        with st.expander("🔬 API Response Inspector — debug zero rows", expanded=False):
+            st.markdown("""
+            <div class="info-box">
+            Use this to inspect the raw Dhan API response for any date/strike.
+            If you see timestamps, check if they match the target date after
+            timezone conversion. If empty, the token or expiry config is wrong.
+            </div>""", unsafe_allow_html=True)
+            dbg_col1, dbg_col2, dbg_col3 = st.columns(3)
+            dbg_date   = dbg_col1.text_input("Test Date", value=str(date.today() - timedelta(days=5)))
+            dbg_strike = dbg_col2.selectbox("Strike", ["ATM","ATM+1","ATM-1","ATM+2","ATM-2"], index=0, key="dbg_strike")
+            dbg_otype  = dbg_col3.selectbox("Option Type", ["CALL","PUT"], key="dbg_otype")
+            if st.button("🔍 Inspect Raw API Response", key="dbg_btn"):
+                with st.spinner("Calling API..."):
+                    raw = fetch_rolling_option(
+                        symbol, dbg_date, dbg_date,
+                        dbg_strike, dbg_otype, interval, expiry_code, expiry_flag)
+                if raw:
+                    ts_list = raw.get("timestamp", [])
+                    st.success(f"✅ API returned {len(ts_list)} timestamps")
+                    if ts_list:
+                        # Show first and last
+                        for label, ts in [("First", ts_list[0]), ("Last", ts_list[-1])]:
+                            dt_utc = datetime.fromtimestamp(ts, tz=pytz.UTC).astimezone(IST)
+                            dt_loc = datetime.fromtimestamp(ts).replace(tzinfo=IST)
+                            st.markdown(f"**{label} ts:** `{ts}` → UTC→IST: `{dt_utc}` | Local→IST: `{dt_loc}`")
+                        # Show as table
+                        dbg_df = pd.DataFrame({
+                            "timestamp_epoch": ts_list[:10],
+                            "dt_utc_to_ist":   [datetime.fromtimestamp(t, tz=pytz.UTC).astimezone(IST).strftime("%Y-%m-%d %H:%M") for t in ts_list[:10]],
+                            "dt_local_ist":    [datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M") for t in ts_list[:10]],
+                            "spot":    raw.get("spot",   [None]*len(ts_list))[:10],
+                            "strike":  raw.get("strike", [None]*len(ts_list))[:10],
+                            "oi":      raw.get("oi",     [None]*len(ts_list))[:10],
+                            "iv":      raw.get("iv",     [None]*len(ts_list))[:10],
+                        })
+                        st.dataframe(dbg_df, use_container_width=True, hide_index=True)
+                        # Auto-detect correct timezone
+                        target_d = datetime.strptime(dbg_date, "%Y-%m-%d").date()
+                        utc_match = sum(1 for t in ts_list
+                            if datetime.fromtimestamp(t, tz=pytz.UTC).astimezone(IST).date() == target_d)
+                        loc_match = sum(1 for t in ts_list
+                            if datetime.fromtimestamp(t).date() == target_d)
+                        st.markdown(f"""
+                        <div class="info-box">
+                        Timestamps matching target date <b>{dbg_date}</b>:<br>
+                        UTC→IST interpretation: <b>{utc_match}/{len(ts_list)}</b> match<br>
+                        Local→IST interpretation: <b>{loc_match}/{len(ts_list)}</b> match<br>
+                        {"✅ UTC→IST is correct" if utc_match > loc_match
+                         else ("✅ Local→IST is correct — Dhan sends IST epoch" if loc_match > utc_match
+                               else "⚠️ Neither matches — check expiry_code or date")}
+                        </div>""", unsafe_allow_html=True)
+                else:
+                    st.error("❌ API returned empty/None. Check: token validity, symbol, expiry_code.")
 
         # Show fetched days table
         if done_dates:
