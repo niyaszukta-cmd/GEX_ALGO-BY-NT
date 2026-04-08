@@ -61,6 +61,179 @@ def get_headers() -> Dict:
     }
 
 # ============================================================================
+# DATABASE — SQLite
+# ============================================================================
+def init_db():
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS raw_chain (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol        TEXT, trade_date TEXT, timestamp TEXT,
+            strike_type   TEXT, strike REAL, spot_price REAL,
+            call_oi REAL, put_oi REAL, call_vol REAL, put_vol REAL,
+            call_iv REAL, put_iv REAL,
+            call_gex REAL, put_gex REAL, net_gex REAL,
+            call_vanna REAL, put_vanna REAL, net_vanna REAL,
+            call_oi_chg REAL, put_oi_chg REAL,
+            interval TEXT, expiry_code INTEGER, expiry_flag TEXT,
+            UNIQUE(symbol,trade_date,timestamp,strike_type,expiry_code,expiry_flag)
+        )""")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS cascade_signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT, trade_date TEXT, timestamp TEXT, spot_price REAL,
+            bear_fuel_pts REAL, bear_absorb_pts REAL,
+            bull_fuel_pts REAL, bull_absorb_pts REAL,
+            bear_quality REAL, bull_quality REAL,
+            iv_regime TEXT, avg_iv REAL, iv_skew REAL,
+            net_gex_total REAL, signal TEXT, signal_strength REAL,
+            cascade_target REAL, cascade_stop REAL,
+            UNIQUE(symbol,trade_date,timestamp)
+        )""")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS bt_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT, trade_date TEXT, entry_time TEXT, exit_time TEXT,
+            direction TEXT, entry_price REAL, exit_price REAL,
+            pts_captured REAL, cascade_target REAL, cascade_stop REAL,
+            exit_reason TEXT, bear_quality REAL, bull_quality REAL,
+            iv_regime TEXT, signal_strength REAL,
+            is_expiry_day INTEGER, expiry_flag TEXT
+        )""")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS fetch_log (
+            symbol TEXT, trade_date TEXT, expiry_code INTEGER, expiry_flag TEXT,
+            status TEXT, rows_fetched INTEGER, fetched_at TEXT,
+            PRIMARY KEY(symbol,trade_date,expiry_code,expiry_flag)
+        )""")
+    con.commit()
+    con.close()
+
+def get_fetch_log(symbol: str, expiry_code: int, expiry_flag: str) -> set:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        "SELECT trade_date FROM fetch_log WHERE symbol=? AND expiry_code=? AND expiry_flag=? AND status='ok'",
+        (symbol, expiry_code, expiry_flag))
+    done = {r[0] for r in cur.fetchall()}
+    con.close()
+    return done
+
+def log_fetch(symbol, trade_date, expiry_code, expiry_flag, status, rows):
+    con = sqlite3.connect(DB_PATH)
+    con.execute(
+        "INSERT OR REPLACE INTO fetch_log (symbol,trade_date,expiry_code,expiry_flag,status,rows_fetched,fetched_at) VALUES (?,?,?,?,?,?,?)",
+        (symbol, trade_date, expiry_code, expiry_flag, status, rows,
+         datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')))
+    con.commit()
+    con.close()
+
+def save_raw_chain(rows: List[Dict]):
+    if not rows: return
+    con = sqlite3.connect(DB_PATH)
+    con.executemany("""
+        INSERT OR IGNORE INTO raw_chain
+        (symbol,trade_date,timestamp,strike_type,strike,spot_price,
+         call_oi,put_oi,call_vol,put_vol,call_iv,put_iv,
+         call_gex,put_gex,net_gex,call_vanna,put_vanna,net_vanna,
+         call_oi_chg,put_oi_chg,interval,expiry_code,expiry_flag)
+        VALUES
+        (:symbol,:trade_date,:timestamp,:strike_type,:strike,:spot_price,
+         :call_oi,:put_oi,:call_vol,:put_vol,:call_iv,:put_iv,
+         :call_gex,:put_gex,:net_gex,:call_vanna,:put_vanna,:net_vanna,
+         :call_oi_chg,:put_oi_chg,:interval,:expiry_code,:expiry_flag)
+    """, rows)
+    con.commit()
+    con.close()
+
+def load_raw_chain(symbol, date_str, expiry_code, expiry_flag) -> pd.DataFrame:
+    con = sqlite3.connect(DB_PATH)
+    df  = pd.read_sql_query(
+        "SELECT * FROM raw_chain WHERE symbol=? AND trade_date=? AND expiry_code=? AND expiry_flag=? ORDER BY timestamp,strike",
+        con, params=(symbol, date_str, expiry_code, expiry_flag))
+    con.close()
+    if not df.empty:
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+    return df
+
+def save_signals(rows: List[Dict]):
+    if not rows: return
+    con = sqlite3.connect(DB_PATH)
+    con.executemany("""
+        INSERT OR REPLACE INTO cascade_signals
+        (symbol,trade_date,timestamp,spot_price,bear_fuel_pts,bear_absorb_pts,
+         bull_fuel_pts,bull_absorb_pts,bear_quality,bull_quality,
+         iv_regime,avg_iv,iv_skew,net_gex_total,signal,signal_strength,
+         cascade_target,cascade_stop)
+        VALUES
+        (:symbol,:trade_date,:timestamp,:spot_price,:bear_fuel_pts,:bear_absorb_pts,
+         :bull_fuel_pts,:bull_absorb_pts,:bear_quality,:bull_quality,
+         :iv_regime,:avg_iv,:iv_skew,:net_gex_total,:signal,:signal_strength,
+         :cascade_target,:cascade_stop)
+    """, rows)
+    con.commit()
+    con.close()
+
+def load_signals(symbol, date_str) -> pd.DataFrame:
+    con = sqlite3.connect(DB_PATH)
+    df  = pd.read_sql_query(
+        "SELECT * FROM cascade_signals WHERE symbol=? AND trade_date=? ORDER BY timestamp",
+        con, params=(symbol, date_str))
+    con.close()
+    if not df.empty:
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+    return df
+
+def save_trades(rows: List[Dict]):
+    if not rows: return
+    con = sqlite3.connect(DB_PATH)
+    con.executemany("""
+        INSERT INTO bt_trades
+        (symbol,trade_date,entry_time,exit_time,direction,entry_price,exit_price,
+         pts_captured,cascade_target,cascade_stop,exit_reason,
+         bear_quality,bull_quality,iv_regime,signal_strength,is_expiry_day,expiry_flag)
+        VALUES
+        (:symbol,:trade_date,:entry_time,:exit_time,:direction,:entry_price,:exit_price,
+         :pts_captured,:cascade_target,:cascade_stop,:exit_reason,
+         :bear_quality,:bull_quality,:iv_regime,:signal_strength,:is_expiry_day,:expiry_flag)
+    """, rows)
+    con.commit()
+    con.close()
+
+def load_trades(symbol=None) -> pd.DataFrame:
+    con = sqlite3.connect(DB_PATH)
+    df  = pd.read_sql_query(
+        "SELECT * FROM bt_trades WHERE symbol=? ORDER BY trade_date,entry_time" if symbol
+        else "SELECT * FROM bt_trades ORDER BY trade_date,entry_time",
+        con, params=(symbol,) if symbol else ())
+    con.close()
+    return df
+
+def clear_trades(symbol=None):
+    con = sqlite3.connect(DB_PATH)
+    if symbol:
+        con.execute("DELETE FROM bt_trades WHERE symbol=?", (symbol,))
+    else:
+        con.execute("DELETE FROM bt_trades")
+    con.commit()
+    con.close()
+
+def db_stats() -> Dict:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT COUNT(*) FROM raw_chain");          raw_rows = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(DISTINCT trade_date), COUNT(DISTINCT symbol) FROM raw_chain")
+    days, syms = cur.fetchone()
+    cur.execute("SELECT COUNT(*) FROM bt_trades");          trades = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM cascade_signals");    sigs   = cur.fetchone()[0]
+    con.close()
+    return {"raw_rows": raw_rows, "days": days, "symbols": syms,
+            "trades": trades, "signals": sigs}
+
+
+
+# ============================================================================
 # CHECKPOINT — mid-session resume at strike level
 # ============================================================================
 CKPT_PATH = "hedgex_checkpoint.json"
