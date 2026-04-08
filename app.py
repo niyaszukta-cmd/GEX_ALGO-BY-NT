@@ -35,6 +35,7 @@ CKPT_PATH = "hedgex_checkpoint.json"
 
 DHAN_CLIENT_ID    = "1100480354"
 DHAN_ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzc1NzIwNzAwLCJhcHBfaWQiOiJhYjYxZmJmOSIsImlhdCI6MTc3NTYzNDMwMCwidG9rZW5Db25zdW1lclR5cGUiOiJBUFAiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwMDQ4MDM1NCJ9.FQxQjX8a3pc4SmMCjqd5yk2S-juo140hlWNGg_0_MqpHIm6mgki5v0315FFvAIfWxlnuNY5R31RjTTfSPxD0-w"
+
 DHAN_INDEX_SECURITY_IDS = {
     "NIFTY": 13, "BANKNIFTY": 25, "FINNIFTY": 27, "MIDCPNIFTY": 442, "SENSEX": 51,
 }
@@ -157,11 +158,14 @@ def init_db():
         is_expiry_day INTEGER, expiry_flag TEXT,
         bt_mode TEXT DEFAULT 'INTRADAY')""")
 
-    # Migration: add bt_mode and pnl_per_lot if DB was created by v2
-    for col, defval in [("bt_mode","'INTRADAY'"), ("pnl_per_lot","0.0")]:
-        try:
-            cur.execute(f"ALTER TABLE bt_trades ADD COLUMN {col} TEXT DEFAULT {defval}")
-        except: pass
+    # Migration: add new columns if DB was created by v2 (errors = column already exists, safe to ignore)
+    try: cur.execute("ALTER TABLE bt_trades ADD COLUMN bt_mode TEXT DEFAULT 'INTRADAY'")
+    except: pass
+    try: cur.execute("ALTER TABLE bt_trades ADD COLUMN pnl_per_lot REAL DEFAULT 0.0")
+    except: pass
+    # Back-fill pnl_per_lot=0 for any rows that are NULL (migrated from v2)
+    cur.execute("UPDATE bt_trades SET pnl_per_lot=0.0 WHERE pnl_per_lot IS NULL")
+    cur.execute("UPDATE bt_trades SET bt_mode='INTRADAY' WHERE bt_mode IS NULL")
 
     cur.execute("""CREATE TABLE IF NOT EXISTS fetch_log(
         symbol TEXT, trade_date TEXT, expiry_code INTEGER, expiry_flag TEXT,
