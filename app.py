@@ -147,11 +147,16 @@ def _get_token() -> str:
     return _FALLBACK_TOKEN
 
 def get_headers() -> Dict:
-    if "dhan_token" not in st.session_state:
-        st.session_state.dhan_token = _get_token()
+    # Token priority: sidebar manual input > st.secrets > fallback
+    token = st.session_state.get("manual_token", "").strip()
+    if not token:
+        if "dhan_token" not in st.session_state:
+            st.session_state.dhan_token = _get_token()
+        token = st.session_state.dhan_token
+    client_id = st.session_state.get("manual_client_id", "").strip() or "1100480354"
     return {
-        "access-token": st.session_state.dhan_token,
-        "client-id":    "1100480354",
+        "access-token": token,
+        "client-id":    client_id,
         "Content-Type": "application/json",
     }
 
@@ -443,11 +448,19 @@ def db_stats() -> Dict:
 # ============================================================================
 def fetch_rolling_option(symbol: str, from_date: str, to_date: str,
                          strike_type: str, option_type: str,
-                         interval: str, expiry_code: int, expiry_flag: str) -> Optional[Dict]:
-    sec_id      = DHAN_INDEX_SECURITY_IDS.get(symbol)
-    if sec_id is None: return None
-    exchange    = "BSE_FNO" if symbol in BSE_FNO_SYMBOLS else "NSE_FNO"
-    payload     = {
+                         interval: str, expiry_code: int, expiry_flag: str,
+                         silent: bool = True) -> Optional[Dict]:
+    """
+    silent=True  → suppress st.warning (used during bulk fetch loops)
+    silent=False → show full error detail (used by API Inspector)
+    """
+    sec_id   = DHAN_INDEX_SECURITY_IDS.get(symbol)
+    if sec_id is None:
+        if not silent:
+            st.error(f"Unknown symbol: {symbol}")
+        return None
+    exchange = "BSE_FNO" if symbol in BSE_FNO_SYMBOLS else "NSE_FNO"
+    payload  = {
         "exchangeSegment": exchange,
         "interval":        interval,
         "securityId":      sec_id,
@@ -466,10 +479,21 @@ def fetch_rolling_option(symbol: str, from_date: str, to_date: str,
             headers=get_headers(), json=payload, timeout=30,
         )
         if resp.status_code == 200:
-            return resp.json().get("data", {})
+            data = resp.json().get("data", {})
+            # Empty data dict = valid auth but no records for this date/expiry
+            return data if data else None
+        else:
+            if not silent:
+                st.error(
+                    f"**HTTP {resp.status_code}** — {symbol} {strike_type} {option_type}\n\n"
+                    f"**Response body:** `{resp.text[:600]}`\n\n"
+                    f"**Payload sent:** `{json.dumps(payload, indent=2)}`"
+                )
+            return None
     except Exception as e:
-        st.warning(f"API error {symbol} {strike_type} {option_type}: {e}")
-    return None
+        if not silent:
+            st.error(f"Request exception: {e}")
+        return None
 
 # ============================================================================
 # CHECKPOINT — mid-session resume at strike level
@@ -1162,6 +1186,47 @@ def main():
 
     # ── SIDEBAR ──────────────────────────────────────────────────────────────
     with st.sidebar:
+        # ── Token Configuration ───────────────────────────────────────────────
+        st.markdown("### 🔑 Dhan API Credentials")
+        with st.expander("Enter Token (required)", expanded="manual_token" not in st.session_state):
+            manual_cid = st.text_input(
+                "Client ID",
+                value=st.session_state.get("manual_client_id", "1100480354"),
+                key="_cid_input",
+            )
+            manual_tok = st.text_area(
+                "Access Token (paste full JWT)",
+                value=st.session_state.get("manual_token", ""),
+                height=100,
+                key="_tok_input",
+                help="From Dhan web → API → Access Token. Expires daily.",
+            )
+            if st.button("💾 Save Token", use_container_width=True, type="primary"):
+                st.session_state.manual_client_id = manual_cid.strip()
+                st.session_state.manual_token     = manual_tok.strip()
+                # Reset cached token so get_headers picks up new one
+                st.session_state.pop("dhan_token", None)
+                st.success("✅ Token saved for this session.")
+                st.rerun()
+
+            # Show token status
+            current_tok = st.session_state.get("manual_token", "").strip()
+            if current_tok and len(current_tok) > 20:
+                st.markdown(
+                    f'<div style="background:rgba(16,185,129,0.1);border:1px solid #10b981;'
+                    f'border-radius:6px;padding:6px 10px;font-family:monospace;font-size:0.7rem;">'
+                    f'✅ Token set — ...{current_tok[-20:]}</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    '<div style="background:rgba(239,68,68,0.1);border:1px solid #ef4444;'
+                    'border-radius:6px;padding:6px 10px;font-family:monospace;font-size:0.7rem;">'
+                    '❌ No token — fetch will fail</div>',
+                    unsafe_allow_html=True,
+                )
+
+        st.markdown("---")
         st.markdown("### ⚙️ Backtest Configuration")
         symbol = st.selectbox("Index", list(INDEX_CONFIG.keys()), index=0)
         expiry_flag = st.selectbox("Expiry Type", ["WEEK", "MONTH"], index=0)
@@ -1332,7 +1397,8 @@ def main():
                 with st.spinner("Calling API..."):
                     raw = fetch_rolling_option(
                         symbol, dbg_date, dbg_date,
-                        dbg_strike, dbg_otype, interval, expiry_code, expiry_flag)
+                        dbg_strike, dbg_otype, interval, expiry_code, expiry_flag,
+                        silent=False)  # show full HTTP errors
                 if raw:
                     ts_list = raw.get("timestamp", [])
                     st.success(f"✅ API returned {len(ts_list)} timestamps")
