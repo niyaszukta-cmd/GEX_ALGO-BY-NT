@@ -147,16 +147,29 @@ def _get_token() -> str:
     return _FALLBACK_TOKEN
 
 def get_headers() -> Dict:
-    # Token priority: sidebar manual input > st.secrets > fallback
-    token = st.session_state.get("manual_token", "").strip()
+    """
+    Token priority:
+    1. st.session_state["manual_token"]  — pasted in sidebar (widget key = direct storage)
+    2. st.secrets["DHAN_ACCESS_TOKEN"]   — Streamlit Cloud secrets
+    3. TOTP auto-generate                — if pyotp + secrets configured
+    4. _FALLBACK_TOKEN                   — placeholder (will 401)
+    """
+    token     = (st.session_state.get("manual_token", "") or "").strip()
+    client_id = (st.session_state.get("manual_client_id", "") or "").strip()
+
+    if not token or not token.startswith("eyJ"):
+        # Try secrets
+        try:
+            token = st.secrets.get("DHAN_ACCESS_TOKEN", "") or ""
+        except Exception:
+            token = ""
+
     if not token:
-        if "dhan_token" not in st.session_state:
-            st.session_state.dhan_token = _get_token()
-        token = st.session_state.dhan_token
-    client_id = st.session_state.get("manual_client_id", "").strip() or "1100480354"
+        token = _get_token()   # TOTP or fallback
+
     return {
         "access-token": token,
-        "client-id":    client_id,
+        "client-id":    client_id or "1100480354",
         "Content-Type": "application/json",
     }
 
@@ -1188,43 +1201,79 @@ def main():
     with st.sidebar:
         # ── Token Configuration ───────────────────────────────────────────────
         st.markdown("### 🔑 Dhan API Credentials")
-        with st.expander("Enter Token (required)", expanded="manual_token" not in st.session_state):
-            manual_cid = st.text_input(
+        with st.expander("🔑 Enter Token (required)", expanded=True):
+            # Read directly from widget keys — avoids Streamlit rerun stale value bug
+            st.text_input(
                 "Client ID",
                 value=st.session_state.get("manual_client_id", "1100480354"),
-                key="_cid_input",
+                key="manual_client_id",
             )
-            manual_tok = st.text_area(
+            st.text_area(
                 "Access Token (paste full JWT)",
                 value=st.session_state.get("manual_token", ""),
-                height=100,
-                key="_tok_input",
-                help="From Dhan web → API → Access Token. Expires daily.",
+                height=120,
+                key="manual_token",
+                help="Dhan web → API → Access Token. Expires daily. Paste full eyJ... string.",
+                placeholder="eyJ0eXAiOiJKV1Qi...",
             )
-            if st.button("💾 Save Token", use_container_width=True, type="primary"):
-                st.session_state.manual_client_id = manual_cid.strip()
-                st.session_state.manual_token     = manual_tok.strip()
-                # Reset cached token so get_headers picks up new one
-                st.session_state.pop("dhan_token", None)
-                st.success("✅ Token saved for this session.")
-                st.rerun()
 
-            # Show token status
+            # Token status
             current_tok = st.session_state.get("manual_token", "").strip()
-            if current_tok and len(current_tok) > 20:
-                st.markdown(
-                    f'<div style="background:rgba(16,185,129,0.1);border:1px solid #10b981;'
-                    f'border-radius:6px;padding:6px 10px;font-family:monospace;font-size:0.7rem;">'
-                    f'✅ Token set — ...{current_tok[-20:]}</div>',
-                    unsafe_allow_html=True,
-                )
+            current_cid = st.session_state.get("manual_client_id", "").strip()
+
+            if current_tok and current_tok.startswith("eyJ") and len(current_tok) > 50:
+                st.success(f"✅ Token set · ...{current_tok[-20:]}")
+            elif current_tok:
+                st.warning("⚠️ Token looks malformed — should start with eyJ")
             else:
-                st.markdown(
-                    '<div style="background:rgba(239,68,68,0.1);border:1px solid #ef4444;'
-                    'border-radius:6px;padding:6px 10px;font-family:monospace;font-size:0.7rem;">'
-                    '❌ No token — fetch will fail</div>',
-                    unsafe_allow_html=True,
-                )
+                st.error("❌ No token pasted — API calls will fail")
+
+            # Validate token with a live ping
+            if st.button("🔌 Validate Token (live ping)", use_container_width=True):
+                if not current_tok:
+                    st.error("Paste a token first.")
+                else:
+                    with st.spinner("Pinging Dhan API..."):
+                        test_payload = {
+                            "exchangeSegment": "NSE_FNO",
+                            "interval": "60",
+                            "securityId": 13,
+                            "instrument": "OPTIDX",
+                            "expiryFlag": "WEEK",
+                            "expiryCode": 1,
+                            "strike": "ATM",
+                            "drvOptionType": "CALL",
+                            "requiredData": ["close","oi"],
+                            "fromDate": (datetime.now(IST) - timedelta(days=5)).strftime("%Y-%m-%d"),
+                            "toDate":   (datetime.now(IST) - timedelta(days=3)).strftime("%Y-%m-%d"),
+                        }
+                        test_headers = {
+                            "access-token": current_tok,
+                            "client-id":    current_cid or "1100480354",
+                            "Content-Type": "application/json",
+                        }
+                        try:
+                            r = requests.post(
+                                f"{DHAN_BASE}/charts/rollingoption",
+                                headers=test_headers,
+                                json=test_payload,
+                                timeout=15,
+                            )
+                            if r.status_code == 200:
+                                data = r.json().get("data", {})
+                                n_ts = len(data.get("timestamp", []))
+                                st.success(
+                                    f"✅ Token VALID — HTTP 200 · {n_ts} timestamps returned "
+                                    f"(empty is OK for holiday dates)"
+                                )
+                            elif r.status_code == 401:
+                                err_msg = r.json().get("errorMessage", r.text[:200])
+                                st.error("Token INVALID (401) — " + err_msg + " — Generate a fresh token from Dhan web portal.")
+
+                            else:
+                                st.warning(f"HTTP {r.status_code}: {r.text[:300]}")
+                        except Exception as ex:
+                            st.error(f"Connection error: {ex}")
 
         st.markdown("---")
         st.markdown("### ⚙️ Backtest Configuration")
