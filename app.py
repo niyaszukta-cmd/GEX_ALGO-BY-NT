@@ -456,16 +456,20 @@ def db_stats() -> Dict:
     return {"raw_rows": raw_rows, "days": days, "symbols": syms,
             "trades": trades, "signals": sigs}
 
+
 # ============================================================================
-# DHAN API — DATA FETCHER
+# DHAN API — DATA FETCHER  (mirrors working dashboard exactly)
 # ============================================================================
+
 def fetch_rolling_option(symbol: str, from_date: str, to_date: str,
                          strike_type: str, option_type: str,
                          interval: str, expiry_code: int, expiry_flag: str,
                          silent: bool = True) -> Optional[Dict]:
     """
-    silent=True  → suppress st.warning (used during bulk fetch loops)
-    silent=False → show full error detail (used by API Inspector)
+    Calls /v2/charts/rollingoption.
+    Returns the raw 'data' dict  →  { 'ce': {...}, 'pe': {...} }
+    for CALL requests, or just the matched side.
+    silent=False → show full HTTP error (used by Inspector).
     """
     sec_id   = DHAN_INDEX_SECURITY_IDS.get(symbol)
     if sec_id is None:
@@ -492,74 +496,17 @@ def fetch_rolling_option(symbol: str, from_date: str, to_date: str,
             headers=get_headers(), json=payload, timeout=30,
         )
         if resp.status_code == 200:
-            data = resp.json().get("data", {})
-            # Empty data dict = valid auth but no records for this date/expiry
-            return data if data else None
-        else:
-            if not silent:
-                st.error(
-                    f"**HTTP {resp.status_code}** — {symbol} {strike_type} {option_type}\n\n"
-                    f"**Response body:** `{resp.text[:600]}`\n\n"
-                    f"**Payload sent:** `{json.dumps(payload, indent=2)}`"
-                )
-            return None
+            return resp.json().get("data", {}) or None
+        if not silent:
+            st.error(
+                f"**HTTP {resp.status_code}** — {symbol} {strike_type} {option_type}\n\n"
+                f"**Response:** `{resp.text[:600]}`\n\n"
+                f"**Payload:** `{json.dumps(payload, indent=2)}`"
+            )
+        return None
     except Exception as e:
         if not silent:
             st.error(f"Request exception: {e}")
-        return None
-
-# ============================================================================
-# CHECKPOINT — mid-session resume at strike level
-# ============================================================================
-CKPT_PATH = "hedgex_checkpoint.json"
-
-def save_checkpoint(symbol: str, trade_date: str, expiry_code: int,
-                    expiry_flag: str, completed_strikes: List[str],
-                    partial_rows: List[Dict]) -> None:
-    """Persist progress so a crashed session can resume."""
-    ckpt = {
-        "symbol":            symbol,
-        "trade_date":        trade_date,
-        "expiry_code":       expiry_code,
-        "expiry_flag":       expiry_flag,
-        "completed_strikes": completed_strikes,
-        "partial_rows":      partial_rows,
-        "saved_at":          datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
-    }
-    with open(CKPT_PATH, "w") as f:
-        json.dump(ckpt, f)
-
-def load_checkpoint(symbol: str, trade_date: str,
-                    expiry_code: int, expiry_flag: str) -> Tuple[List[str], List[Dict]]:
-    """
-    Returns (completed_strikes, partial_rows) if a matching checkpoint exists,
-    else ([], []).
-    """
-    if not os.path.exists(CKPT_PATH):
-        return [], []
-    try:
-        with open(CKPT_PATH) as f:
-            ckpt = json.load(f)
-        if (ckpt["symbol"]      == symbol
-                and ckpt["trade_date"]   == trade_date
-                and ckpt["expiry_code"]  == expiry_code
-                and ckpt["expiry_flag"]  == expiry_flag):
-            return ckpt["completed_strikes"], ckpt["partial_rows"]
-    except Exception:
-        pass
-    return [], []
-
-def clear_checkpoint() -> None:
-    if os.path.exists(CKPT_PATH):
-        os.remove(CKPT_PATH)
-
-def checkpoint_status() -> Optional[Dict]:
-    if not os.path.exists(CKPT_PATH):
-        return None
-    try:
-        with open(CKPT_PATH) as f:
-            return json.load(f)
-    except Exception:
         return None
 
 
@@ -567,132 +514,139 @@ def fetch_one_day(symbol: str, trade_date: str, strikes: List[str],
                   interval: str, expiry_code: int, expiry_flag: str,
                   progress_bar=None, status_text=None) -> int:
     """
-    Fetch one trading day — CALL + PUT per strike, process rows, save to DB.
-    Uses local dict (no function attributes) — thread-safe.
-    Checkpoints after every strike so crashes can resume mid-day.
+    Mirrors process_historical_data() from the working dashboard exactly:
+      - from_date = target - 2 days,  to_date = target + 2 days
+      - call_data['ce'] / put_data['pe']  ← nested response structure
+      - timestamp filtered to target_dt.date() via UTC→IST
+      - Greeks computed per bar
+      - OI diff per strike across timestamps
+    Checkpoints after every strike.
     """
     cfg           = INDEX_CONFIG.get(symbol, {})
     contract_size = cfg.get("contract_size", 25)
     scaling       = 1e9
     tte           = 7/365 if expiry_flag == "WEEK" else 30/365
-    target_dt     = datetime.strptime(trade_date, "%Y-%m-%d").date()
-    # Dhan rollingoption requires a date RANGE that brackets the expiry cycle.
-    # Passing exact date returns 0 rows — the API needs ±2 days around target.
-    # This matches the working dashboard's proven pattern exactly.
+    target_dt     = datetime.strptime(trade_date, "%Y-%m-%d")
+    # ±2 day window — required by Dhan rollingoption (matches working dashboard)
     from_date     = (target_dt - timedelta(days=2)).strftime("%Y-%m-%d")
     to_date       = (target_dt + timedelta(days=2)).strftime("%Y-%m-%d")
 
-    # ── Resume from checkpoint if available ──────────────────────────────────
+    # Resume from checkpoint if available
     completed_strikes, all_rows = load_checkpoint(
         symbol, trade_date, expiry_code, expiry_flag)
     remaining_strikes = [s for s in strikes if s not in completed_strikes]
 
     total = len(strikes) * 2
-    done  = len(completed_strikes) * 2   # already done
+    done  = len(completed_strikes) * 2
 
-    # ── Per-strike: fetch CALL + PUT, pair immediately, process rows ─────────
     for stype in remaining_strikes:
-        # Use plain local dict — no function attribute, fully thread-safe
-        strike_data: Dict[str, Dict] = {}
-
-        for otype in ["CALL", "PUT"]:
-            if status_text:
-                status_text.text(
-                    f"Fetching {symbol} {stype} {otype} | {trade_date} "
-                    f"({len(completed_strikes)+1}/{len(strikes)})"
-                )
-            data = fetch_rolling_option(
-                symbol, from_date, to_date,
-                stype, otype, interval, expiry_code, expiry_flag,
+        if status_text:
+            status_text.text(
+                f"Fetching {symbol} {stype} CALL+PUT | {trade_date} "
+                f"({len(completed_strikes)+1}/{len(strikes)})"
             )
-            done += 1
-            if progress_bar:
-                progress_bar.progress(min(done / total, 1.0))
-            time.sleep(0.3)
 
-            if data:
-                strike_data[otype] = data
+        # ── Fetch CALL ────────────────────────────────────────────────────────
+        call_data = fetch_rolling_option(
+            symbol, from_date, to_date,
+            stype, "CALL", interval, expiry_code, expiry_flag,
+        )
+        done += 1
+        if progress_bar:
+            progress_bar.progress(min(done / total, 1.0))
+        time.sleep(0.3)
 
-        # ── Pair CALL + PUT for this strike ───────────────────────────────────
-        ce = strike_data.get("CALL", {})
-        pe = strike_data.get("PUT",  {})
+        # ── Fetch PUT ─────────────────────────────────────────────────────────
+        put_data = fetch_rolling_option(
+            symbol, from_date, to_date,
+            stype, "PUT", interval, expiry_code, expiry_flag,
+        )
+        done += 1
+        if progress_bar:
+            progress_bar.progress(min(done / total, 1.0))
+        time.sleep(0.3)
 
-        if ce:
-            ts_list = ce.get("timestamp", [])
-            n_ts    = len(ts_list)
-            for i, ts in enumerate(ts_list):
-                try:
-                    # Try UTC interpretation first
-                    dt_ist = datetime.fromtimestamp(ts, tz=pytz.UTC).astimezone(IST)
-                    # Dhan sometimes returns epoch already in IST (no TZ offset).
-                    # If the UTC interpretation gives wrong date, treat as IST-local.
-                    if dt_ist.date() != target_dt:
-                        dt_ist_local = datetime.fromtimestamp(ts).replace(tzinfo=IST)
-                        if dt_ist_local.date() == target_dt:
-                            dt_ist = dt_ist_local
-                        else:
-                            continue  # genuinely wrong date — skip
+        if not call_data or not put_data:
+            completed_strikes.append(stype)
+            save_checkpoint(symbol, trade_date, expiry_code, expiry_flag,
+                            completed_strikes, all_rows)
+            continue
 
-                    def _safe(src, key, default, idx):
-                        arr = src.get(key, [])
-                        return arr[idx] if idx < len(arr) else default
+        # ── Extract ce / pe exactly as working dashboard does ─────────────────
+        ce = call_data.get("ce", {})
+        pe = put_data.get("pe",  {})
+        if not ce:
+            completed_strikes.append(stype)
+            save_checkpoint(symbol, trade_date, expiry_code, expiry_flag,
+                            completed_strikes, all_rows)
+            continue
 
-                    spot   = _safe(ce, "spot",   0,  i) or 0
-                    strike = _safe(ce, "strike", 0,  i) or 0
-                    if spot == 0 or strike == 0:
-                        continue
-
-                    c_oi  = _safe(ce, "oi",     0,  i) or 0
-                    p_oi  = _safe(pe, "oi",     0,  i) or 0  if pe else 0
-                    c_vol = _safe(ce, "volume", 0,  i) or 0
-                    p_vol = _safe(pe, "volume", 0,  i) or 0  if pe else 0
-                    c_iv  = _safe(ce, "iv",    15,  i) or 15
-                    p_iv  = _safe(pe, "iv",    15,  i) or 15 if pe else 15
-
-                    civ = c_iv / 100 if c_iv > 1 else float(c_iv)
-                    piv = p_iv / 100 if p_iv > 1 else float(p_iv)
-                    civ = max(civ, 0.01)
-                    piv = max(piv, 0.01)
-
-                    cg = BS.gamma(spot, strike, tte, RISK_FREE, civ)
-                    pg = BS.gamma(spot, strike, tte, RISK_FREE, piv)
-                    cv = BS.vanna(spot, strike, tte, RISK_FREE, civ)
-                    pv = BS.vanna(spot, strike, tte, RISK_FREE, piv)
-
-                    all_rows.append({
-                        "symbol":      symbol,
-                        "trade_date":  trade_date,
-                        "timestamp":   dt_ist.strftime("%Y-%m-%d %H:%M:%S"),
-                        "strike_type": stype,
-                        "strike":      float(strike),
-                        "spot_price":  float(spot),
-                        "call_oi":     float(c_oi),
-                        "put_oi":      float(p_oi),
-                        "call_vol":    float(c_vol),
-                        "put_vol":     float(p_vol),
-                        "call_iv":     float(c_iv),
-                        "put_iv":      float(p_iv),
-                        "call_gex":    float((c_oi * cg * spot**2 * contract_size) / scaling),
-                        "put_gex":     float(-(p_oi * pg * spot**2 * contract_size) / scaling),
-                        "net_gex":     float((c_oi * cg - p_oi * pg) * spot**2 * contract_size / scaling),
-                        "call_vanna":  float(c_oi * cv * spot * contract_size / scaling),
-                        "put_vanna":   float(p_oi * pv * spot * contract_size / scaling),
-                        "net_vanna":   float((c_oi * cv + p_oi * pv) * spot * contract_size / scaling),
-                        "call_oi_chg": 0.0,
-                        "put_oi_chg":  0.0,
-                        "interval":    interval,
-                        "expiry_code": expiry_code,
-                        "expiry_flag": expiry_flag,
-                    })
-                except Exception:
+        # ── Process each timestamp bar ─────────────────────────────────────────
+        ts_list = ce.get("timestamp", [])
+        for i, ts in enumerate(ts_list):
+            try:
+                dt_ist = datetime.fromtimestamp(ts, tz=pytz.UTC).astimezone(IST)
+                if dt_ist.date() != target_dt.date():
                     continue
 
-        # ── Mark this strike done, checkpoint ─────────────────────────────────
+                def _g(src, key, default):
+                    arr = src.get(key, [])
+                    return arr[i] if i < len(arr) else default
+
+                spot   = _g(ce, "spot",   0) or 0
+                strike = _g(ce, "strike", 0) or 0
+                if spot == 0 or strike == 0:
+                    continue
+
+                c_oi  = _g(ce, "oi",     0) or 0
+                p_oi  = _g(pe, "oi",     0) or 0
+                c_vol = _g(ce, "volume", 0) or 0
+                p_vol = _g(pe, "volume", 0) or 0
+                c_iv  = _g(ce, "iv",    15) or 15
+                p_iv  = _g(pe, "iv",    15) or 15
+
+                civ = max(c_iv / 100 if c_iv > 1 else float(c_iv), 0.01)
+                piv = max(p_iv / 100 if p_iv > 1 else float(p_iv), 0.01)
+
+                cg = BS.gamma(spot, strike, tte, RISK_FREE, civ)
+                pg = BS.gamma(spot, strike, tte, RISK_FREE, piv)
+                cv = BS.vanna(spot, strike, tte, RISK_FREE, civ)
+                pv = BS.vanna(spot, strike, tte, RISK_FREE, piv)
+
+                all_rows.append({
+                    "symbol":      symbol,
+                    "trade_date":  trade_date,
+                    "timestamp":   dt_ist.strftime("%Y-%m-%d %H:%M:%S"),
+                    "strike_type": stype,
+                    "strike":      float(strike),
+                    "spot_price":  float(spot),
+                    "call_oi":     float(c_oi),
+                    "put_oi":      float(p_oi),
+                    "call_vol":    float(c_vol),
+                    "put_vol":     float(p_vol),
+                    "call_iv":     float(c_iv),
+                    "put_iv":      float(p_iv),
+                    "call_gex":    float((c_oi * cg * spot**2 * contract_size) / scaling),
+                    "put_gex":     float(-(p_oi * pg * spot**2 * contract_size) / scaling),
+                    "net_gex":     float((c_oi * cg - p_oi * pg) * spot**2 * contract_size / scaling),
+                    "call_vanna":  float(c_oi * cv * spot * contract_size / scaling),
+                    "put_vanna":   float(p_oi * pv * spot * contract_size / scaling),
+                    "net_vanna":   float((c_oi * cv + p_oi * pv) * spot * contract_size / scaling),
+                    "call_oi_chg": 0.0,
+                    "put_oi_chg":  0.0,
+                    "interval":    interval,
+                    "expiry_code": expiry_code,
+                    "expiry_flag": expiry_flag,
+                })
+            except Exception:
+                continue
+
+        # ── Strike done — checkpoint ──────────────────────────────────────────
         completed_strikes.append(stype)
         save_checkpoint(symbol, trade_date, expiry_code, expiry_flag,
                         completed_strikes, all_rows)
 
-    # ── Compute OI change per strike across timestamps ────────────────────────
+    # ── OI change per strike across timestamps ────────────────────────────────
     if all_rows:
         df = pd.DataFrame(all_rows).sort_values(["strike", "timestamp"])
         for st_val in df["strike"].unique():
@@ -703,11 +657,12 @@ def fetch_one_day(symbol: str, trade_date: str, strikes: List[str],
 
     if not all_rows and status_text:
         status_text.text(
-            f"⚠️ {trade_date}: API responded but 0 rows matched target date. "
-            f"Check token validity and expiry_code."
+            f"WARNING: {trade_date} — 0 rows after processing. "
+            f"ce keys returned: {list(ce.keys()) if ce else 'none'}"
         )
+
     save_raw_chain(all_rows)
-    clear_checkpoint()        # day complete — remove checkpoint
+    clear_checkpoint()
     return len(all_rows)
 
 # ============================================================================
@@ -1455,40 +1410,35 @@ def main():
                         dbg_strike, dbg_otype, interval, expiry_code, expiry_flag,
                         silent=False)  # show full HTTP errors
                 if raw:
-                    ts_list = raw.get("timestamp", [])
-                    st.success(f"✅ API returned {len(ts_list)} timestamps")
+                    # Response structure: {'ce': {'timestamp':[], 'oi':[], ...}, 'pe': {...}}
+                    ce = raw.get("ce", {})
+                    pe = raw.get("pe", {})
+                    ts_list = ce.get("timestamp", [])
+                    st.success(f"✅ API returned data — ce keys: {list(ce.keys())} | {len(ts_list)} timestamps")
                     if ts_list:
-                        # Show first and last
-                        for label, ts in [("First", ts_list[0]), ("Last", ts_list[-1])]:
-                            dt_utc = datetime.fromtimestamp(ts, tz=pytz.UTC).astimezone(IST)
-                            dt_loc = datetime.fromtimestamp(ts).replace(tzinfo=IST)
-                            st.markdown(f"**{label} ts:** `{ts}` → UTC→IST: `{dt_utc}` | Local→IST: `{dt_loc}`")
-                        # Show as table
+                        target_d  = datetime.strptime(dbg_date, "%Y-%m-%d").date()
+                        match_ts  = [t for t in ts_list
+                                     if datetime.fromtimestamp(t, tz=pytz.UTC).astimezone(IST).date() == target_d]
+                        st.info(f"Timestamps matching {dbg_date}: **{len(match_ts)}/{len(ts_list)}** (UTC→IST filter)")
+                        show_ts = ts_list[:10]
                         dbg_df = pd.DataFrame({
-                            "timestamp_epoch": ts_list[:10],
-                            "dt_utc_to_ist":   [datetime.fromtimestamp(t, tz=pytz.UTC).astimezone(IST).strftime("%Y-%m-%d %H:%M") for t in ts_list[:10]],
-                            "dt_local_ist":    [datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M") for t in ts_list[:10]],
-                            "spot":    raw.get("spot",   [None]*len(ts_list))[:10],
-                            "strike":  raw.get("strike", [None]*len(ts_list))[:10],
-                            "oi":      raw.get("oi",     [None]*len(ts_list))[:10],
-                            "iv":      raw.get("iv",     [None]*len(ts_list))[:10],
+                            "epoch":         show_ts,
+                            "UTC→IST":       [datetime.fromtimestamp(t, tz=pytz.UTC).astimezone(IST).strftime("%Y-%m-%d %H:%M") for t in show_ts],
+                            "spot":          ce.get("spot",   [None]*len(ts_list))[:10],
+                            "strike":        ce.get("strike", [None]*len(ts_list))[:10],
+                            "oi":            ce.get("oi",     [None]*len(ts_list))[:10],
+                            "iv":            ce.get("iv",     [None]*len(ts_list))[:10],
+                            "volume":        ce.get("volume", [None]*len(ts_list))[:10],
                         })
                         st.dataframe(dbg_df, use_container_width=True, hide_index=True)
-                        # Auto-detect correct timezone
-                        target_d = datetime.strptime(dbg_date, "%Y-%m-%d").date()
-                        utc_match = sum(1 for t in ts_list
-                            if datetime.fromtimestamp(t, tz=pytz.UTC).astimezone(IST).date() == target_d)
-                        loc_match = sum(1 for t in ts_list
-                            if datetime.fromtimestamp(t).date() == target_d)
-                        st.markdown(f"""
-                        <div class="info-box">
-                        Timestamps matching target date <b>{dbg_date}</b>:<br>
-                        UTC→IST interpretation: <b>{utc_match}/{len(ts_list)}</b> match<br>
-                        Local→IST interpretation: <b>{loc_match}/{len(ts_list)}</b> match<br>
-                        {"✅ UTC→IST is correct" if utc_match > loc_match
-                         else ("✅ Local→IST is correct — Dhan sends IST epoch" if loc_match > utc_match
-                               else "⚠️ Neither matches — check expiry_code or date")}
-                        </div>""", unsafe_allow_html=True)
+                        if len(match_ts) == 0:
+                            st.warning(
+                                "0 timestamps match the target date after UTC→IST conversion. "
+                                "This means the API returned data for a different expiry window. "
+                                "Try a different expiry_code (2 or 3) or check if the date is a trading day."
+                            )
+                    else:
+                        st.warning("API returned 200 but ce.timestamp is empty. Try a different date or expiry_code.")
                 else:
                     st.error("❌ API returned empty/None. Check: token validity, symbol, expiry_code.")
 
