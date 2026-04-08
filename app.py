@@ -45,7 +45,7 @@ st.set_page_config(
 # CONSTANTS & CONFIG
 # ============================================================================
 IST          = pytz.timezone('Asia/Kolkata')
-DHAN_BASE    = "https://api.dhan.co"
+DHAN_BASE    = "https://api.dhan.co/v2"
 RISK_FREE    = 0.07
 DB_PATH      = "hedgex_backtest.db"
 
