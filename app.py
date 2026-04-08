@@ -35,6 +35,7 @@ CKPT_PATH = "hedgex_checkpoint.json"
 
 DHAN_CLIENT_ID    = "1100480354"
 DHAN_ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzc1NzIwNzAwLCJhcHBfaWQiOiJhYjYxZmJmOSIsImlhdCI6MTc3NTYzNDMwMCwidG9rZW5Db25zdW1lclR5cGUiOiJBUFAiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwMDQ4MDM1NCJ9.FQxQjX8a3pc4SmMCjqd5yk2S-juo140hlWNGg_0_MqpHIm6mgki5v0315FFvAIfWxlnuNY5R31RjTTfSPxD0-w"
+
 DHAN_INDEX_SECURITY_IDS = {
     "NIFTY": 13, "BANKNIFTY": 25, "FINNIFTY": 27, "MIDCPNIFTY": 442, "SENSEX": 51,
 }
@@ -1025,14 +1026,19 @@ def build_trade_table(trades, contract_size):
                      "Buy (₹)","Sell (₹)","Pts","P&L/Lot",
                      "Target","Stop","Exit","IV","Expiry"]
     disp["Expiry"] = disp["Expiry"].map({0:"",1:"✓"})
-    return disp
+    return disp.reset_index(drop=True)
 
 def style_trade_table(df):
+    """Row colouring — resets index to guarantee uniqueness for Styler."""
+    df = df.reset_index(drop=True)
     def rc(row):
         clr = "rgba(16,185,129,0.12)" if "▲" in str(row.get("P&L/Lot","")) \
               else "rgba(239,68,68,0.10)"
         return [f"background-color:{clr}"]*len(row)
-    return df.style.apply(rc, axis=1)
+    try:
+        return df.style.apply(rc, axis=1)
+    except Exception:
+        return df   # fallback: plain DataFrame if Styler fails
 
 # ── Metric card renderer ──────────────────────────────────────────────────────
 def render_kpi_row(kpis, cols):
@@ -1156,7 +1162,7 @@ def render_results_section(trades, symbol, mode_label, contract_size, lots):
         mo_grp["Pts"]    = mo_grp["Pts"].round(1)
         mo_grp["P&L (₹)"]= mo_grp["PnL_per_Lot"].apply(lambda x: f"₹{x:,.0f}")
         mo_grp["Result"] = mo_grp["Pts"].apply(lambda x: "🟢" if x>0 else "🔴")
-        disp_mo = mo_grp[["Month","Result","Trades","Wins","Losses","Hit%","Pts","P&L (₹)"]].copy()
+        disp_mo = mo_grp[["Month","Result","Trades","Wins","Losses","Hit%","Pts","P&L (₹)"]].copy().reset_index(drop=True)
         st.dataframe(disp_mo, use_container_width=True, hide_index=True)
         st.plotly_chart(monthly_pnl_chart(trades), use_container_width=True)
 
