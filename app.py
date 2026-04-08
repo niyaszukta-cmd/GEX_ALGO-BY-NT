@@ -576,11 +576,11 @@ def fetch_one_day(symbol: str, trade_date: str, strikes: List[str],
     scaling       = 1e9
     tte           = 7/365 if expiry_flag == "WEEK" else 30/365
     target_dt     = datetime.strptime(trade_date, "%Y-%m-%d").date()
-    # Dhan rollingoption: use exact day for both fromDate and toDate.
-    # A ±1 day buffer causes the API to return adjacent-expiry data
-    # which then fails the date filter and produces 0 rows.
-    from_date     = trade_date
-    to_date       = trade_date
+    # Dhan rollingoption requires a date RANGE that brackets the expiry cycle.
+    # Passing exact date returns 0 rows — the API needs ±2 days around target.
+    # This matches the working dashboard's proven pattern exactly.
+    from_date     = (target_dt - timedelta(days=2)).strftime("%Y-%m-%d")
+    to_date       = (target_dt + timedelta(days=2)).strftime("%Y-%m-%d")
 
     # ── Resume from checkpoint if available ──────────────────────────────────
     completed_strikes, all_rows = load_checkpoint(
@@ -1244,7 +1244,8 @@ def main():
                             "strike": "ATM",
                             "drvOptionType": "CALL",
                             "requiredData": ["close","oi"],
-                            "fromDate": (datetime.now(IST) - timedelta(days=5)).strftime("%Y-%m-%d"),
+                            # Use ±2 day window around test date (required by Dhan rollingoption)
+                            "fromDate": (datetime.now(IST) - timedelta(days=7)).strftime("%Y-%m-%d"),
                             "toDate":   (datetime.now(IST) - timedelta(days=3)).strftime("%Y-%m-%d"),
                         }
                         test_headers = {
@@ -1443,9 +1444,14 @@ def main():
             dbg_strike = dbg_col2.selectbox("Strike", ["ATM","ATM+1","ATM-1","ATM+2","ATM-2"], index=0, key="dbg_strike")
             dbg_otype  = dbg_col3.selectbox("Option Type", ["CALL","PUT"], key="dbg_otype")
             if st.button("🔍 Inspect Raw API Response", key="dbg_btn"):
+                # Use ±2 day window — rollingoption requires range bracketing expiry
+                dbg_dt    = datetime.strptime(dbg_date, "%Y-%m-%d").date()
+                dbg_from  = (dbg_dt - timedelta(days=2)).strftime("%Y-%m-%d")
+                dbg_to    = (dbg_dt + timedelta(days=2)).strftime("%Y-%m-%d")
+                st.caption(f"Fetching range: {dbg_from} → {dbg_to} (filtering to {dbg_date})")
                 with st.spinner("Calling API..."):
                     raw = fetch_rolling_option(
-                        symbol, dbg_date, dbg_date,
+                        symbol, dbg_from, dbg_to,
                         dbg_strike, dbg_otype, interval, expiry_code, expiry_flag,
                         silent=False)  # show full HTTP errors
                 if raw:
