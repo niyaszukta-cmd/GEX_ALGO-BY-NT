@@ -1280,51 +1280,55 @@ def main():
                 "pts_captured","pnl_per_lot","contract_size",
                 "cascade_trigger_pts","cascade_target","cascade_stop",
                 "exit_reason","iv_regime","is_expiry_day"
-            ]].copy()
+            ]].copy().reset_index(drop=True)
 
-            disp["entry_time"] = pd.to_datetime(disp["entry_time"]).dt.strftime("%H:%M")
-            disp["exit_time"]  = pd.to_datetime(disp["exit_time"]).dt.strftime("%H:%M")
-            disp["is_expiry_day"] = disp["is_expiry_day"].map({0:"","1":"Expiry",1:"Expiry"})
-
-            # Build color mask BEFORE renaming (avoids pandas Styler KeyError on special chars)
-            pnl_values = disp["pnl_per_lot"].values
+            disp["entry_time"]    = pd.to_datetime(disp["entry_time"]).dt.strftime("%H:%M")
+            disp["exit_time"]     = pd.to_datetime(disp["exit_time"]).dt.strftime("%H:%M")
+            disp["is_expiry_day"] = disp["is_expiry_day"].map({0:"", "1":"Expiry", 1:"Expiry"})
+            # Add a plain Win/Loss tag column for visual scanning — no Styler needed
+            disp["W/L"] = disp["pnl_per_lot"].apply(lambda x: "✅ WIN" if x > 0 else "❌ LOSS")
 
             disp = disp.rename(columns={
-                "trade_date": "Date",
-                "backtest_mode": "Mode",
-                "entry_time": "Entry",
-                "exit_time": "Exit",
-                "option_type": "Option",
-                "strike_used": "Strike",
-                "direction": "Dir",
-                "entry_spot": "Entry Spot",
-                "exit_spot": "Exit Spot",
-                "option_buy_price": "Buy Px",
-                "option_sell_price": "Sell Px",
-                "pts_captured": "Spot Pts",
-                "pnl_per_lot": "PnL per Lot",
-                "contract_size": "Lot Size",
+                "trade_date":          "Date",
+                "backtest_mode":       "Mode",
+                "entry_time":          "Entry",
+                "exit_time":           "Exit",
+                "option_type":         "Option",
+                "strike_used":         "Strike",
+                "direction":           "Dir",
+                "entry_spot":          "Entry Spot",
+                "exit_spot":           "Exit Spot",
+                "option_buy_price":    "Buy Px",
+                "option_sell_price":   "Sell Px",
+                "pts_captured":        "Spot Pts",
+                "pnl_per_lot":         "PnL/Lot",
+                "contract_size":       "Lot Size",
                 "cascade_trigger_pts": "Cascade Pts",
-                "cascade_target": "Target",
-                "cascade_stop": "Stop",
-                "exit_reason": "Exit Reason",
-                "iv_regime": "IV Regime",
-                "is_expiry_day": "Expiry",
+                "cascade_target":      "Target",
+                "cascade_stop":        "Stop",
+                "exit_reason":         "Exit Reason",
+                "iv_regime":           "IV Regime",
+                "is_expiry_day":       "Expiry",
             })
 
-            def row_color(row):
-                idx = row.name
-                val = pnl_values[idx] if idx < len(pnl_values) else 0
-                if val > 0:
-                    return ["background-color:rgba(16,185,129,0.12)"] * len(row)
-                return ["background-color:rgba(239,68,68,0.10)"] * len(row)
-
-            try:
-                styled = disp.reset_index(drop=True).style.apply(row_color, axis=1)
-                st.dataframe(styled, use_container_width=True, height=600, hide_index=True)
-            except Exception:
-                # Fallback: plain dataframe without styling
-                st.dataframe(disp, use_container_width=True, height=600, hide_index=True)
+            # Use st.dataframe with column_config for safe color — no Styler, no KeyError
+            st.dataframe(
+                disp,
+                use_container_width=True,
+                height=600,
+                hide_index=True,
+                column_config={
+                    "PnL/Lot": st.column_config.NumberColumn(
+                        "PnL/Lot (Rs.)",
+                        format="%.2f",
+                        help="Profit or Loss per lot in Rupees"),
+                    "Buy Px": st.column_config.NumberColumn("Buy Px", format="%.2f"),
+                    "Sell Px": st.column_config.NumberColumn("Sell Px", format="%.2f"),
+                    "Entry Spot": st.column_config.NumberColumn("Entry Spot", format="%.2f"),
+                    "Exit Spot": st.column_config.NumberColumn("Exit Spot", format="%.2f"),
+                    "Cascade Pts": st.column_config.NumberColumn("Cascade Pts", format="%.1f"),
+                    "Spot Pts": st.column_config.NumberColumn("Spot Pts", format="%.2f"),
+                })
 
             # Summary table by option type
             st.markdown("#### 📊 Summary by Option Type")
@@ -1334,8 +1338,8 @@ def main():
                 Avg_PnL=("pnl_per_lot","mean"),
                 Avg_Cascade_Pts=("cascade_trigger_pts","mean"),
             ).reset_index()
-            summ["Total_PnL"]       = summ["Total_PnL"].apply(lambda x: f"₹{x:+,.0f}")
-            summ["Avg_PnL"]         = summ["Avg_PnL"].apply(lambda x: f"₹{x:+,.0f}")
+            summ["Total_PnL"]       = summ["Total_PnL"].apply(lambda x: f"Rs.{x:+,.0f}")
+            summ["Avg_PnL"]         = summ["Avg_PnL"].apply(lambda x: f"Rs.{x:+,.0f}")
             summ["Avg_Cascade_Pts"] = summ["Avg_Cascade_Pts"].apply(lambda x: f"{x:.1f} pts")
             st.dataframe(summ, use_container_width=True, hide_index=True)
 
