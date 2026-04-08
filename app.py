@@ -35,7 +35,6 @@ CKPT_PATH = "hedgex_checkpoint.json"
 
 DHAN_CLIENT_ID    = "1100480354"
 DHAN_ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzc1NzIwNzAwLCJhcHBfaWQiOiJhYjYxZmJmOSIsImlhdCI6MTc3NTYzNDMwMCwidG9rZW5Db25zdW1lclR5cGUiOiJBUFAiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwMDQ4MDM1NCJ9.FQxQjX8a3pc4SmMCjqd5yk2S-juo140hlWNGg_0_MqpHIm6mgki5v0315FFvAIfWxlnuNY5R31RjTTfSPxD0-w"
-
 DHAN_INDEX_SECURITY_IDS = {
     "NIFTY": 13, "BANKNIFTY": 25, "FINNIFTY": 27, "MIDCPNIFTY": 442, "SENSEX": 51,
 }
@@ -163,8 +162,9 @@ def init_db():
     except: pass
     try: cur.execute("ALTER TABLE bt_trades ADD COLUMN pnl_per_lot REAL DEFAULT 0.0")
     except: pass
-    # Back-fill pnl_per_lot=0 for any rows that are NULL (migrated from v2)
+    # Back-fill pnl_per_lot for rows migrated from v2 (NULL or corrupted text value)
     cur.execute("UPDATE bt_trades SET pnl_per_lot=0.0 WHERE pnl_per_lot IS NULL")
+    cur.execute("UPDATE bt_trades SET pnl_per_lot=0.0 WHERE CAST(pnl_per_lot AS TEXT) NOT GLOB "*[0-9]*"")
     cur.execute("UPDATE bt_trades SET bt_mode='INTRADAY' WHERE bt_mode IS NULL")
 
     cur.execute("""CREATE TABLE IF NOT EXISTS fetch_log(
@@ -858,36 +858,53 @@ def run_backtest_for_day(signals, symbol, trade_date, expiry_flag,
 # ── Metrics ───────────────────────────────────────────────────────────────────
 def compute_metrics(trades, contract_size=25, lots=1):
     if trades.empty: return {}
-    pts   = trades["pts_captured"]
-    pnl   = trades["pnl_per_lot"] if "pnl_per_lot" in trades.columns else pts * contract_size
-    wins  = pts[pts>0]; losses = pts[pts<=0]
-    total = len(trades); hit = len(wins)/total*100 if total else 0
-    pf    = (wins.sum()/abs(losses.sum())) if losses.sum()!=0 else float("inf")
-    cum   = pts.cumsum(); dd = (cum.cummax()-cum).max()
-    sh    = (pts.mean()/pts.std()*np.sqrt(250)) if pts.std()>0 else 0
-    neg   = pts[pts<0].std()
-    so    = (pts.mean()/neg*np.sqrt(250)) if neg and neg>0 else 0
-    t2    = trades.copy()
-    t2["tm"] = abs(t2["cascade_target"]-t2["entry_price"])
-    t2["am"] = abs(t2["pts_captured"])
-    ca    = (t2["am"]>=t2["tm"]*0.7).mean()*100
+
+    # Force numeric — SQLite migrations can leave TEXT in numeric columns
+    trades = trades.copy()
+    for col in ["pts_captured","pnl_per_lot","cascade_target","entry_price","is_expiry_day"]:
+        if col in trades.columns:
+            trades[col] = pd.to_numeric(trades[col], errors="coerce").fillna(0.0)
+
+    pts  = trades["pts_captured"]
+    # pnl_per_lot: use column if present and non-zero, otherwise derive
+    if "pnl_per_lot" in trades.columns and trades["pnl_per_lot"].abs().sum() > 0:
+        pnl = trades["pnl_per_lot"]
+    else:
+        pnl = pts * contract_size * lots
+
+    wins   = pts[pts > 0];  losses = pts[pts <= 0]
+    pnl_w  = pnl[pts > 0];  pnl_l  = pnl[pts <= 0]
+    total  = len(trades);   hit = len(wins)/total*100 if total else 0
+    pf     = (wins.sum()/abs(losses.sum())) if losses.sum() != 0 else float("inf")
+    cum    = pts.cumsum();  dd = (cum.cummax() - cum).max()
+    sh     = (pts.mean()/pts.std()*np.sqrt(250)) if pts.std() > 0 else 0
+    neg    = pts[pts < 0].std()
+    so     = (pts.mean()/neg*np.sqrt(250)) if (neg and neg > 0) else 0
+    t2     = trades.copy()
+    t2["tm"] = (t2["cascade_target"] - t2["entry_price"]).abs()
+    t2["am"] = t2["pts_captured"].abs()
+    ca     = (t2["am"] >= t2["tm"]*0.7).mean()*100 if len(t2) else 0
+
+    exp_mask     = trades["is_expiry_day"].astype(int) == 1
+    non_exp_mask = trades["is_expiry_day"].astype(int) == 0
+
     return {
         "total_trades":    total,
-        "hit_rate":        round(hit,1),
-        "total_pts":       round(pts.sum(),1),
-        "total_pnl":       round(pnl.sum(),1),
-        "avg_pts_win":     round(wins.mean(),1) if len(wins) else 0,
-        "avg_pts_loss":    round(losses.mean(),1) if len(losses) else 0,
-        "avg_pnl_win":     round((pnl[pts>0]).mean(),1) if len(wins) else 0,
-        "avg_pnl_loss":    round((pnl[pts<=0]).mean(),1) if len(losses) else 0,
-        "profit_factor":   round(pf,2),
-        "max_drawdown":    round(dd,1),
-        "sharpe":          round(sh,2),
-        "sortino":         round(so,2),
-        "cascade_accuracy":round(ca,1),
-        "expiry_trades":   int(trades["is_expiry_day"].sum()),
-        "expiry_pts":      round(trades[trades["is_expiry_day"]==1]["pts_captured"].sum(),1),
-        "non_expiry_pts":  round(trades[trades["is_expiry_day"]==0]["pts_captured"].sum(),1),
+        "hit_rate":        round(hit, 1),
+        "total_pts":       round(float(pts.sum()), 1),
+        "total_pnl":       round(float(pnl.sum()), 1),
+        "avg_pts_win":     round(float(wins.mean()), 1)   if len(wins)   else 0.0,
+        "avg_pts_loss":    round(float(losses.mean()), 1) if len(losses) else 0.0,
+        "avg_pnl_win":     round(float(pnl_w.mean()), 1) if len(pnl_w)  else 0.0,
+        "avg_pnl_loss":    round(float(pnl_l.mean()), 1) if len(pnl_l)  else 0.0,
+        "profit_factor":   round(float(pf), 2),
+        "max_drawdown":    round(float(dd), 1),
+        "sharpe":          round(float(sh), 2),
+        "sortino":         round(float(so), 2),
+        "cascade_accuracy":round(float(ca), 1),
+        "expiry_trades":   int(exp_mask.sum()),
+        "expiry_pts":      round(float(pts[exp_mask].sum()), 1),
+        "non_expiry_pts":  round(float(pts[non_exp_mask].sum()), 1),
     }
 
 # ── Chart helpers ─────────────────────────────────────────────────────────────
@@ -905,9 +922,11 @@ def equity_curve_chart(trades):
     return fig
 
 def pnl_lot_chart(trades):
-    t=trades.copy().reset_index(drop=True)
-    if "pnl_per_lot" not in t.columns: t["pnl_per_lot"]=0.0
-    t["cum_pnl"]=t["pnl_per_lot"].cumsum()
+    t = trades.copy().reset_index(drop=True)
+    if "pnl_per_lot" not in t.columns:
+        t["pnl_per_lot"] = 0.0
+    t["pnl_per_lot"] = pd.to_numeric(t["pnl_per_lot"], errors="coerce").fillna(0.0)
+    t["cum_pnl"] = t["pnl_per_lot"].cumsum()
     fig=make_subplots(rows=2,cols=1,shared_xaxes=True,row_heights=[0.65,0.35],
                       subplot_titles=["Cumulative P&L per Lot (₹)","Per-Trade P&L per Lot (₹)"])
     fig.add_trace(go.Scatter(x=t.index,y=t["cum_pnl"],mode="lines",
@@ -969,6 +988,12 @@ def build_trade_table(trades, contract_size):
     if trades.empty: return pd.DataFrame()
     t = trades.copy()
 
+    # Force numeric to survive SQLite text migration
+    for col in ["entry_price","exit_price","pts_captured","pnl_per_lot",
+                "cascade_target","cascade_stop","is_expiry_day"]:
+        if col in t.columns:
+            t[col] = pd.to_numeric(t[col], errors="coerce").fillna(0.0)
+
     # Buy / Sell labelling based on direction
     t["Buy Price"]  = t.apply(lambda r: r["entry_price"] if r["direction"]=="CALL"
                                else r["exit_price"], axis=1)
@@ -976,7 +1001,7 @@ def build_trade_table(trades, contract_size):
                                else r["entry_price"], axis=1)
 
     # P&L per lot in ₹
-    if "pnl_per_lot" not in t.columns:
+    if "pnl_per_lot" not in t.columns or t["pnl_per_lot"].abs().sum() == 0:
         t["pnl_per_lot"] = t["pts_captured"] * contract_size
 
     t["P&L/Lot (₹)"] = t["pnl_per_lot"].apply(lambda x: f"{'▲' if x>=0 else '▼'} ₹{x:,.0f}")
@@ -1112,6 +1137,10 @@ def render_results_section(trades, symbol, mode_label, contract_size, lots):
 
     with rt5:
         trades2 = trades.copy()
+        trades2["pnl_per_lot"] = pd.to_numeric(trades2.get("pnl_per_lot", 0),
+                                                errors="coerce").fillna(0.0)
+        trades2["pts_captured"] = pd.to_numeric(trades2["pts_captured"],
+                                                errors="coerce").fillna(0.0)
         trades2["Month"] = pd.to_datetime(trades2["trade_date"]).dt.to_period("M").astype(str)
         mo_grp = trades2.groupby("Month").agg(
             Trades=("pts_captured","count"),
