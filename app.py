@@ -968,17 +968,17 @@ def main():
             '</div>', unsafe_allow_html=True)
         st.markdown("---")
         st.markdown("### 🗑️ Data Management")
-        if st.button("Clear Trades Only", use_container_width=True):
+        if st.button("Clear Trades Only", use_container_width=True, key="sb_clear_trades"):
             clear_trades(symbol)
             st.success("Trades cleared"); st.rerun()
-        if st.button("Clear Signals Only", use_container_width=True):
+        if st.button("Clear Signals Only", use_container_width=True, key="sb_clear_signals"):
             clear_signals_only(symbol)
             st.success("Signals cleared"); st.rerun()
         st.markdown('<div class="danger-box">⚠️ The button below wipes ALL data — raw chain, signals, trades, fetch log and checkpoint.</div>',
                     unsafe_allow_html=True)
-        nuke_confirm = st.checkbox("I understand — delete everything")
+        nuke_confirm = st.checkbox("I understand — delete everything", key="sb_nuke_confirm")
         if st.button("🔴 WIPE ALL DATA & START AFRESH", type="primary",
-                     use_container_width=True, disabled=not nuke_confirm):
+                     use_container_width=True, disabled=not nuke_confirm, key="sb_nuke_btn"):
             clear_all_data()
             st.success("✅ All data wiped. Fresh start."); st.rerun()
 
@@ -1009,7 +1009,7 @@ def main():
                 + str(len(ckpt.get("completed_strikes",[]))) + " strikes done | "
                 + str(len(ckpt.get("partial_rows",[]))) + " rows saved. Next fetch resumes.</div>",
                 unsafe_allow_html=True)
-            if st.button("🗑️ Discard Checkpoint"):
+            if st.button("🗑️ Discard Checkpoint", key="discard_ckpt"):
                 clear_checkpoint(); st.rerun()
 
         trading_dates = get_trading_dates(d_start, d_end)
@@ -1025,7 +1025,7 @@ def main():
                         unsafe_allow_html=True)
 
         fetch_btn = st.button(f"🚀 Fetch {len(pending)} Days", type="primary",
-                              use_container_width=True, disabled=(len(pending)==0))
+                              use_container_width=True, disabled=(len(pending)==0), key="fetch_btn")
         if fetch_btn:
             overall=st.progress(0); day_bar=st.progress(0)
             status=st.empty(); day_status=st.empty(); log_box=st.empty()
@@ -1109,7 +1109,7 @@ def main():
         c3.metric("Pending",        len(pending_sig))
 
         if st.button(f"⚡ Compute Signals for {len(pending_sig)} Days", type="primary",
-                     use_container_width=True, disabled=(len(pending_sig)==0)):
+                     use_container_width=True, disabled=(len(pending_sig)==0), key="compute_sig_btn"):
             prog=st.progress(0); status=st.empty()
             for idx,trade_date in enumerate(pending_sig):
                 status.text(f"Computing {trade_date} ({idx+1}/{len(pending_sig)})")
@@ -1184,18 +1184,20 @@ def main():
                          f'<div class="metric-lbl">{label}</div></div>', unsafe_allow_html=True)
 
         st.markdown("---")
+        k = bt_mode  # unique key prefix per mode — prevents StreamlitDuplicateElementId
         c1,c2 = st.columns([2,1])
-        with c1: st.plotly_chart(equity_curve_chart(trades), use_container_width=True)
-        with c2: st.plotly_chart(call_put_breakdown_chart(trades), use_container_width=True)
+        with c1: st.plotly_chart(equity_curve_chart(trades),        use_container_width=True, key=f"eq_{k}")
+        with c2: st.plotly_chart(call_put_breakdown_chart(trades),  use_container_width=True, key=f"cp_{k}")
         c3,c4 = st.columns(2)
-        with c3: st.plotly_chart(cascade_vs_pnl_chart(trades), use_container_width=True)
-        with c4: st.plotly_chart(exit_reason_chart(trades), use_container_width=True)
+        with c3: st.plotly_chart(cascade_vs_pnl_chart(trades),      use_container_width=True, key=f"cv_{k}")
+        with c4: st.plotly_chart(exit_reason_chart(trades),         use_container_width=True, key=f"er_{k}")
         st.markdown("#### 📅 Monthly P&L")
-        st.plotly_chart(monthly_pnl_chart(trades), use_container_width=True)
+        st.plotly_chart(monthly_pnl_chart(trades), use_container_width=True, key=f"mo_{k}")
         st.download_button(f"📥 Download {mode_label} CSV",
             data=trades.to_csv(index=False),
             file_name=f"hedgex_{symbol}_{bt_mode}.csv",
-            mime="text/csv", use_container_width=True)
+            mime="text/csv", use_container_width=True,
+            key=f"dl_{k}")
 
     # ── Tab 3: Run Intraday BT ────────────────────────────────────────────────
     with tab_ibt:
@@ -1211,7 +1213,7 @@ def main():
             'Days with signals: <b>' + str(len(all_sig_dates)) + '</b>'
             '</div>', unsafe_allow_html=True)
         if st.button("▶ Run INTRADAY Backtest", type="primary",
-                     use_container_width=True, disabled=(len(all_sig_dates)==0)):
+                     use_container_width=True, disabled=(len(all_sig_dates)==0), key="run_intra_btn"):
             clear_trades(symbol, mode="INTRADAY")
             prog=st.progress(0); status=st.empty(); all_trades=[]
             for idx,td in enumerate(all_sig_dates):
@@ -1239,7 +1241,7 @@ def main():
             'Days with signals: <b>' + str(len(all_sig_dates)) + '</b>'
             '</div>', unsafe_allow_html=True)
         if st.button("▶ Run CNC Backtest", type="primary",
-                     use_container_width=True, disabled=(len(all_sig_dates)==0)):
+                     use_container_width=True, disabled=(len(all_sig_dates)==0), key="run_cnc_btn"):
             clear_trades(symbol, mode="CNC")
             prog=st.progress(0); status=st.empty(); all_trades=[]
             for idx,td in enumerate(all_sig_dates):
@@ -1363,17 +1365,17 @@ def main():
         c1,c2,c3 = st.columns(3)
         with c1:
             st.markdown("**Clear Intraday Trades**")
-            if st.button("🗑️ Clear INTRADAY", use_container_width=True):
+            if st.button("🗑️ Clear INTRADAY", use_container_width=True, key="dm_clr_intra"):
                 clear_trades(symbol, mode="INTRADAY")
                 st.success("Intraday trades cleared"); st.rerun()
         with c2:
             st.markdown("**Clear CNC Trades**")
-            if st.button("🗑️ Clear CNC", use_container_width=True):
+            if st.button("🗑️ Clear CNC", use_container_width=True, key="dm_clr_cnc"):
                 clear_trades(symbol, mode="CNC")
                 st.success("CNC trades cleared"); st.rerun()
         with c3:
             st.markdown("**Clear All Trades**")
-            if st.button("🗑️ Clear All Trades", use_container_width=True):
+            if st.button("🗑️ Clear All Trades", use_container_width=True, key="dm_clr_all"):
                 clear_trades()
                 st.success("All trades cleared"); st.rerun()
 
@@ -1383,14 +1385,14 @@ def main():
             st.markdown("**Clear Computed Signals**")
             st.markdown('<div class="warn-box">Removes signals only. Raw data intact. Re-run Tab 2 to recompute.</div>',
                         unsafe_allow_html=True)
-            if st.button("🗑️ Clear Signals for " + symbol, use_container_width=True):
+            if st.button("🗑️ Clear Signals for " + symbol, use_container_width=True, key="dm_clr_sig"):
                 clear_signals_only(symbol)
                 st.success(f"Signals cleared for {symbol}"); st.rerun()
         with col_b:
             st.markdown("**Clear Fetch Log**")
             st.markdown('<div class="warn-box">Clears fetch log — next fetch will re-download all days even if raw data exists in DB.</div>',
                         unsafe_allow_html=True)
-            if st.button("🗑️ Clear Fetch Log for " + symbol, use_container_width=True):
+            if st.button("🗑️ Clear Fetch Log for " + symbol, use_container_width=True, key="dm_clr_log"):
                 con = sqlite3.connect(DB_PATH)
                 con.execute("DELETE FROM fetch_log WHERE symbol=?", (symbol,))
                 con.commit(); con.close()
@@ -1400,9 +1402,9 @@ def main():
         st.markdown("#### ☢️ Full Reset")
         st.markdown('<div class="danger-box">This permanently deletes ALL data across ALL symbols — raw chain, signals, trades, fetch log and checkpoint file. This cannot be undone.</div>',
                     unsafe_allow_html=True)
-        nuke2 = st.checkbox("I confirm — permanently delete everything", key="nuke2")
+        nuke2 = st.checkbox("I confirm — permanently delete everything", key="dm_nuke_confirm")
         if st.button("🔴 WIPE ALL DATA & START AFRESH", type="primary",
-                     use_container_width=True, disabled=not nuke2):
+                     use_container_width=True, disabled=not nuke2, key="dm_nuke_btn"):
             clear_all_data()
             st.success("✅ All data wiped. Ready for a fresh start."); st.rerun()
 
