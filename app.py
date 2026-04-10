@@ -212,6 +212,26 @@ def init_db():
         symbol TEXT, trade_date TEXT, expiry_code INTEGER, expiry_flag TEXT,
         status TEXT, rows_fetched INTEGER, fetched_at TEXT,
         PRIMARY KEY(symbol,trade_date,expiry_code,expiry_flag))""")
+
+    # ── v3 schema migration — safely add new columns to existing bt_trades ──
+    existing_cols = {row[1] for row in cur.execute("PRAGMA table_info(bt_trades)").fetchall()}
+    new_cols = {
+        "peak_premium":       "REAL    DEFAULT 0.0",
+        "lots_used":          "INTEGER DEFAULT 1",
+        "total_pnl":          "REAL    DEFAULT 0.0",
+        "trailing_activated": "INTEGER DEFAULT 0",
+        "cooldown_triggered": "INTEGER DEFAULT 0",
+    }
+    for col, col_def in new_cols.items():
+        if col not in existing_cols:
+            cur.execute(f"ALTER TABLE bt_trades ADD COLUMN {col} {col_def}")
+
+    # Backfill total_pnl for any old rows that have 0 (pnl_per_lot * lots_used)
+    cur.execute("""UPDATE bt_trades SET total_pnl = pnl_per_lot
+                   WHERE total_pnl = 0 AND pnl_per_lot IS NOT NULL""")
+    cur.execute("""UPDATE bt_trades SET lots_used = 1
+                   WHERE lots_used IS NULL OR lots_used = 0""")
+
     con.commit(); con.close()
 
 def get_fetch_log(symbol, expiry_code, expiry_flag):
